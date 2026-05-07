@@ -6,6 +6,7 @@ from datetime import date, datetime, time, timezone
 from pathlib import Path
 from typing import Any
 
+from alpaca.data.enums import Adjustment
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
@@ -40,6 +41,18 @@ class BacktestTrade:
 
 
 @dataclass(frozen=True)
+class BenchmarkResult:
+    symbol: str
+    start_date: date
+    end_date: date
+    buy_price: float
+    sell_price: float
+    ending_equity: float
+    total_return_pct: float
+    max_drawdown_pct: float
+
+
+@dataclass(frozen=True)
 class BacktestResult:
     start: date
     end: date
@@ -49,6 +62,7 @@ class BacktestResult:
     max_drawdown_pct: float
     trades: list[BacktestTrade]
     per_symbol_pnl: dict[str, float]
+    benchmarks: list[BenchmarkResult]
 
 
 class Backtester:
@@ -56,6 +70,7 @@ class Backtester:
         self.config = config
         self.data = StockHistoricalDataClient(api_key=api_key, secret_key=secret_key)
         self.feed = parse_data_feed(config["alpaca"].get("data_feed", "iex"))
+        self.adjustment = parse_adjustment(config["backtest"].get("bar_adjustment", "split"))
 
     def run(self, start: date, end: date) -> BacktestResult:
         settings = self.config["backtest"]
@@ -65,7 +80,7 @@ class Backtester:
         trades: list[BacktestTrade] = []
         per_symbol_pnl = {symbol: 0.0 for symbol in self.config["watchlist"]}
 
-        bars_by_symbol = self.fetch_daily_bars(start, end)
+        bars_by_symbol = self.fetch_daily_bars(self.config["watchlist"], start, end)
         dates = sorted({bar.timestamp.date() for bars in bars_by_symbol.values() for bar in bars})
         bars_by_date = {
             bar_date: {
@@ -196,6 +211,7 @@ class Backtester:
             ending_equity = cash + market_value(positions, bars_by_date[dates[-1]])
 
         total_return_pct = ((ending_equity - starting_cash) / starting_cash) * 100
+        benchmarks = self.run_benchmarks(start=start, end=end, starting_cash=starting_cash)
         return BacktestResult(
             start=start,
             end=end,
@@ -205,20 +221,22 @@ class Backtester:
             max_drawdown_pct=max_drawdown_pct,
             trades=trades,
             per_symbol_pnl=per_symbol_pnl,
+            benchmarks=benchmarks,
         )
 
-    def fetch_daily_bars(self, start: date, end: date) -> dict[str, list[DailyBar]]:
+    def fetch_daily_bars(self, symbols: list[str], start: date, end: date) -> dict[str, list[DailyBar]]:
         request = StockBarsRequest(
-            symbol_or_symbols=self.config["watchlist"],
+            symbol_or_symbols=symbols,
             timeframe=TimeFrame.Day,
             start=datetime.combine(start, time.min, tzinfo=timezone.utc),
             end=datetime.combine(end, time.max, tzinfo=timezone.utc),
+            adjustment=self.adjustment,
             feed=self.feed,
         )
         response = self.data.get_stock_bars(request)
         raw_bars = getattr(response, "data", response)
 
-        bars_by_symbol: dict[str, list[DailyBar]] = {symbol: [] for symbol in self.config["watchlist"]}
+        bars_by_symbol: dict[str, list[DailyBar]] = {symbol: [] for symbol in symbols}
         for symbol, bars in raw_bars.items():
             for bar in bars:
                 bars_by_symbol.setdefault(symbol, []).append(
@@ -233,6 +251,51 @@ class Backtester:
         for bars in bars_by_symbol.values():
             bars.sort(key=lambda item: item.timestamp)
         return {symbol: bars for symbol, bars in bars_by_symbol.items() if bars}
+
+    def run_benchmarks(self, start: date, end: date, starting_cash: float) -> list[BenchmarkResult]:
+        settings = self.config["backtest"]
+        symbols = settings.get("benchmark_symbols", [])
+        if not symbols:
+            return []
+
+        slippage_bps = float(settings["slippage_bps"])
+        bars_by_symbol = self.fetch_daily_bars(symbols, start, end)
+        results: list[BenchmarkResult] = []
+
+        for symbol in symbols:
+            bars = bars_by_symbol.get(symbol, [])
+            if not bars:
+                continue
+
+            buy_price = apply_slippage(bars[0].open, "buy", slippage_bps)
+            sell_price = apply_slippage(bars[-1].close, "sell", slippage_bps)
+            qty = starting_cash / buy_price
+            ending_equity = qty * sell_price
+            total_return_pct = ((ending_equity - starting_cash) / starting_cash) * 100
+
+            peak_equity = starting_cash
+            max_drawdown_pct = 0.0
+            for bar in bars:
+                equity = qty * bar.close
+                peak_equity = max(peak_equity, equity)
+                if peak_equity > 0:
+                    drawdown_pct = ((equity - peak_equity) / peak_equity) * 100
+                    max_drawdown_pct = min(max_drawdown_pct, drawdown_pct)
+
+            results.append(
+                BenchmarkResult(
+                    symbol=symbol,
+                    start_date=bars[0].timestamp.date(),
+                    end_date=bars[-1].timestamp.date(),
+                    buy_price=buy_price,
+                    sell_price=sell_price,
+                    ending_equity=ending_equity,
+                    total_return_pct=total_return_pct,
+                    max_drawdown_pct=max_drawdown_pct,
+                )
+            )
+
+        return results
 
     def execute_signal(
         self,
@@ -296,6 +359,17 @@ def print_backtest_result(result: BacktestResult) -> None:
     win_rate = (winners / traded * 100) if traded else 0.0
     print(f"Winning symbols: {winners}/{traded} ({win_rate:.1f}%)")
 
+    if result.benchmarks:
+        print("\nBenchmark buy-and-hold comparison")
+        for benchmark in result.benchmarks:
+            outperformance = result.total_return_pct - benchmark.total_return_pct
+            print(
+                f"{benchmark.symbol:5} return={benchmark.total_return_pct:7.2f}% "
+                f"ending=${benchmark.ending_equity:,.2f} "
+                f"max_dd={benchmark.max_drawdown_pct:7.2f}% "
+                f"bot_vs={outperformance:+7.2f}%"
+            )
+
     print("\nPer-symbol realized P/L")
     for symbol, pnl in sorted(result.per_symbol_pnl.items(), key=lambda item: item[1], reverse=True):
         if pnl != 0:
@@ -348,3 +422,12 @@ def apply_slippage(price: float, action: str, slippage_bps: float) -> float:
     if action == "sell":
         multiplier = 1 - (slippage_bps / 10000)
     return price * multiplier
+
+
+def parse_adjustment(value: str) -> Adjustment:
+    normalized = str(value).strip().upper()
+    try:
+        return getattr(Adjustment, normalized)
+    except AttributeError as error:
+        valid = ", ".join(item.name.lower() for item in Adjustment)
+        raise ValueError(f"Unsupported bar_adjustment '{value}'. Choose one of: {valid}") from error

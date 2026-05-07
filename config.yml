@@ -46,6 +46,13 @@ runtime:
 
 backtest:
   initial_cash: 10000.0
+  benchmark_symbols:
+    - SMH
+    - SOXX
+    - QQQ
+    - SPY
+  # Use split-adjusted bars so splits do not look like real trading gains/losses.
+  bar_adjustment: split
   # 5 basis points = 0.05%. This makes simulated fills slightly worse than bar prices.
   slippage_bps: 5.0
   liquidate_at_end: true

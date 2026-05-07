@@ -40,6 +40,8 @@ python main.py backtest --start 2025-01-01 --end 2026-05-01
 
 This downloads historical daily bars from Alpaca and simulates the configured momentum rule. Signals are calculated from the daily close compared with the previous daily close, then filled at the next available open with configurable slippage. Results are printed in the terminal and trade history is written to `logs/backtest_trades.csv`.
 
+The backtest also compares the result against configurable buy-and-hold benchmarks. Defaults are `SMH`, `SOXX`, `QQQ`, and `SPY`.
+
 ## Continuous Daily Monitoring
 
 ```bash

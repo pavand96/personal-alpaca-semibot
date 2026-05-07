@@ -33,6 +33,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "backtest": {
         "initial_cash": 10000.0,
+        "benchmark_symbols": ["SMH", "SOXX", "QQQ", "SPY"],
+        "bar_adjustment": "split",
         "slippage_bps": 5.0,
         "liquidate_at_end": True,
         "trades_file": "logs/backtest_trades.csv",
@@ -50,6 +52,9 @@ def load_config(path: str | Path) -> dict[str, Any]:
         deep_merge(config, user_config)
 
     config["watchlist"] = normalize_symbols(config.get("watchlist", []))
+    config["backtest"]["benchmark_symbols"] = normalize_symbols(
+        config["backtest"].get("benchmark_symbols", [])
+    )
     return config
 
 
