@@ -66,7 +66,12 @@ def normalize_symbols(symbols: list[Any]) -> list[str]:
     normalized: list[str] = []
 
     for symbol in symbols:
-        cleaned = str(symbol).strip().upper()
+        if not isinstance(symbol, str):
+            raise ValueError(
+                f"watchlist symbols must be strings; got {symbol!r}. "
+                'Quote YAML-sensitive tickers such as "ON".'
+            )
+        cleaned = symbol.strip().upper()
         if cleaned and cleaned not in seen:
             seen.add(cleaned)
             normalized.append(cleaned)
