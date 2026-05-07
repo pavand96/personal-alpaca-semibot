@@ -497,7 +497,7 @@ class MLStrategy:
         stop_loss_pct = float(self.config["risk"]["stop_loss_pct"])
         take_profit_pct = float(self.config["risk"].get("take_profit_pct", 1.0))
         exit_before_close = parse_hhmm_time(str(self.config["risk"].get("exit_before_close", "15:55")))
-        now_et = datetime.now().astimezone().time()
+        now_et = datetime.now(MARKET_TZ).time()
         should_exit_for_close = now_et >= exit_before_close
 
         decisions: list[Decision] = []

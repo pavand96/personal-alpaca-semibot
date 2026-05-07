@@ -44,7 +44,7 @@ strategy:
 
 risk:
   # Dry run prints/logs intended orders but does not submit them.
-  dry_run: false
+  dry_run: true
   require_market_open: true
   max_orders_per_run: 3
   stop_loss_pct: 0.5
