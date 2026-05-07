@@ -2,7 +2,7 @@
 set -euo pipefail
 
 PROJECT_DIR="/home/pavand96/personal-alpaca-semibot"
-TARGET_DATE="2026-05-08"
+TARGET_DATE="${SEMIBOT_TARGET_DATE:-2026-05-08}"
 export TZ="America/New_York"
 
 RUN_DATE="${SEMIBOT_TEST_DATE:-$(date +%F)}"
@@ -13,7 +13,7 @@ RUN_ONCE="${SEMIBOT_RUN_ONCE:-false}"
 cd "$PROJECT_DIR"
 mkdir -p logs
 
-echo "==== semibot day-long ML dry-run test $(date -Is) ===="
+echo "==== semibot day-long ML paper-order test $(date -Is) ===="
 
 if [ "$RUN_DATE" != "$TARGET_DATE" ]; then
   echo "Skipping: run date $RUN_DATE does not match target date $TARGET_DATE"
@@ -27,8 +27,8 @@ while true; do
   echo "-- ml-signal --"
   .venv/bin/python main.py ml-signal
 
-  echo "-- ml-trade-once dry-run --"
-  .venv/bin/python main.py ml-trade-once
+  echo "-- ml-trade-once paper orders --"
+  .venv/bin/python main.py ml-trade-once --execute
 
   if [ "$RUN_ONCE" = "true" ]; then
     break

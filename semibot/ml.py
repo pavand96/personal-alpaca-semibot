@@ -3,7 +3,7 @@ from __future__ import annotations
 import csv
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from itertools import product
 from pathlib import Path
 from typing import Any
@@ -11,6 +11,10 @@ from typing import Any
 import joblib
 import numpy as np
 import pandas as pd
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
+from alpaca.data.historical import NewsClient
+from alpaca.data.requests import NewsRequest
 from sklearn.base import clone
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
@@ -30,6 +34,7 @@ from semibot.backtest import (
     market_value,
 )
 from semibot.bot import Decision, SemiMomentumBot, format_decision
+from semibot.intraday import MARKET_TZ, SESSION_OPEN, calculate_vwap, is_regular_session
 
 
 NUMERIC_FEATURES = [
@@ -111,12 +116,22 @@ class KellyResult:
     suggested_quarter_notional: float
 
 
+@dataclass(frozen=True)
+class LiveIntradayBar:
+    timestamp: datetime
+    high: float
+    low: float
+    close: float
+    volume: float
+
+
 class MLStrategy:
     def __init__(self, config: dict[str, Any], api_key: str, secret_key: str) -> None:
         self.config = config
         self.api_key = api_key
         self.secret_key = secret_key
         self.backtester = Backtester(config, api_key=api_key, secret_key=secret_key)
+        self.news = NewsClient(api_key=api_key, secret_key=secret_key)
 
     def train(self, start: date, end: date) -> TrainingResult:
         frame = self.load_training_frame(start=start, end=end)
@@ -277,13 +292,27 @@ class MLStrategy:
                     and held_value + per_trade_notional <= max_position_notional
                     and buys_used < max_buys
                 ):
+                    adjusted_notional = correlation_adjusted_notional(
+                        symbol=signal.symbol,
+                        base_notional=per_trade_notional,
+                        held_symbols=[
+                            symbol
+                            for symbol, held_position in positions.items()
+                            if held_position.qty > 0 and symbol != signal.symbol
+                        ],
+                        bars_by_symbol=bars_by_symbol,
+                        as_of_date=current_date,
+                        settings=self.config["portfolio"],
+                    )
+                    if adjusted_notional <= 0:
+                        continue
                     buys_used += 1
                     signals.append(
                         {
                             "symbol": signal.symbol,
                             "action": "buy",
-                            "notional": per_trade_notional,
-                            "reason": signal.reason,
+                            "notional": adjusted_notional,
+                            "reason": f"{signal.reason}; correlation-adjusted notional ${adjusted_notional:.2f}",
                         }
                     )
             pending_signals = signals
@@ -457,15 +486,26 @@ class MLStrategy:
         max_orders = int(self.config["risk"]["max_orders_per_run"])
         per_trade_notional = float(self.config["strategy"]["per_trade_notional"])
         max_position_notional = float(self.config["strategy"]["max_position_notional"])
+        max_total_position_notional = float(self.config["risk"].get("max_total_position_notional", 10000.0))
+        total_position_notional = sum(
+            abs(float(getattr(position, "market_value", 0.0) or 0.0))
+            for position in positions.values()
+        )
         max_buys = int(self.config["strategy"]["max_symbols_to_buy_per_run"])
         buy_probability = float(self.config["ml"]["buy_probability"])
         sell_probability = float(self.config["ml"]["sell_probability"])
         stop_loss_pct = float(self.config["risk"]["stop_loss_pct"])
+        take_profit_pct = float(self.config["risk"].get("take_profit_pct", 1.0))
+        exit_before_close = parse_hhmm_time(str(self.config["risk"].get("exit_before_close", "15:55")))
+        now_et = datetime.now().astimezone().time()
+        should_exit_for_close = now_et >= exit_before_close
 
         decisions: list[Decision] = []
         risk_sell_symbols: set[str] = set()
         for position in positions.values():
             unrealized_plpc = float(getattr(position, "unrealized_plpc", 0.0) or 0.0)
+            unrealized_pct = unrealized_plpc * 100
+            qty = float(position.qty)
             if unrealized_plpc <= -(stop_loss_pct / 100):
                 risk_sell_symbols.add(position.symbol)
                 decisions.append(
@@ -473,12 +513,45 @@ class MLStrategy:
                         position.symbol,
                         "sell",
                         f"live stop loss {unrealized_plpc:.2%} <= -{stop_loss_pct:.2f}%",
-                        qty=float(position.qty),
+                        qty=qty,
                     )
                 )
+                continue
+            if should_exit_for_close:
+                risk_sell_symbols.add(position.symbol)
+                decisions.append(
+                    Decision(
+                        position.symbol,
+                        "sell",
+                        f"exit before close at {exit_before_close.strftime('%H:%M')}",
+                        qty=qty,
+                    )
+                )
+                continue
+            if unrealized_pct >= take_profit_pct:
+                risk_sell_symbols.add(position.symbol)
+                decisions.append(
+                    Decision(
+                        position.symbol,
+                        "sell",
+                        f"take profit {unrealized_pct:.2f}% >= {take_profit_pct:.2f}%",
+                        qty=qty,
+                    )
+                )
+                continue
+
+        signals = self.latest_signals()
+        quality_by_symbol = self.live_entry_quality(
+            [
+                signal.symbol
+                for signal in signals
+                if signal.probability >= buy_probability and signal.symbol not in positions
+            ]
+        )
 
         buys_used = 0
-        for signal in self.latest_signals():
+        queued_buy_notional = 0.0
+        for signal in signals:
             if signal.symbol in risk_sell_symbols:
                 continue
             position = positions.get(signal.symbol)
@@ -487,20 +560,47 @@ class MLStrategy:
             if held_qty > 0 and signal.probability <= sell_probability:
                 decisions.append(Decision(signal.symbol, "sell", signal.reason, qty=held_qty))
                 continue
+            quality_passed, quality_reason = quality_by_symbol.get(
+                signal.symbol,
+                (False, "blocked by live entry quality filter"),
+            )
             if (
                 signal.probability >= buy_probability
+                and quality_passed
+                and held_qty <= 0
                 and held_value + per_trade_notional <= max_position_notional
+                and total_position_notional + queued_buy_notional + per_trade_notional <= max_total_position_notional
                 and buys_used < max_buys
             ):
                 buys_used += 1
+                queued_buy_notional += per_trade_notional
                 decisions.append(
-                    Decision(signal.symbol, "buy", signal.reason, notional=per_trade_notional)
+                    Decision(signal.symbol, "buy", f"{signal.reason}; {quality_reason}", notional=per_trade_notional)
+                )
+            elif signal.probability >= buy_probability and held_qty <= 0 and not quality_passed:
+                decisions.append(
+                    Decision(signal.symbol, "hold", quality_reason)
+                )
+            elif (
+                signal.probability >= buy_probability
+                and total_position_notional + queued_buy_notional + per_trade_notional > max_total_position_notional
+            ):
+                decisions.append(
+                    Decision(
+                        signal.symbol,
+                        "hold",
+                        f"portfolio cap ${max_total_position_notional:,.2f} would be exceeded",
+                    )
                 )
 
         submitted: list[Decision] = []
         for decision in decisions:
             if len(submitted) >= max_orders:
                 break
+            if decision.action == "hold":
+                print(f"ML HOLD {format_decision(decision)}")
+                bot.log_decision(decision, event="ml_hold")
+                continue
             if dry_run:
                 print(f"ML DRY RUN {format_decision(decision)}")
                 bot.log_decision(decision, event="ml_dry_run_order")
@@ -513,6 +613,136 @@ class MLStrategy:
             print("No ML trade signals crossed the configured probability thresholds.")
         return submitted
 
+    def live_entry_quality(self, symbols: list[str]) -> dict[str, tuple[bool, str]]:
+        settings = self.config.get("live_entry_filter", {})
+        if not bool(settings.get("enabled", True)):
+            return {symbol: (True, "entry filter disabled") for symbol in symbols}
+        if not symbols:
+            return {}
+
+        now = datetime.now(MARKET_TZ)
+        min_time = parse_hhmm_time(str(settings.get("min_time", "09:45")))
+        if now.time() < min_time:
+            return {
+                symbol: (False, f"blocked before entry filter start {min_time.strftime('%H:%M')}")
+                for symbol in symbols
+            }
+
+        lookback_days = int(settings.get("average_volume_lookback_days", 20))
+        request = StockBarsRequest(
+            symbol_or_symbols=symbols,
+            timeframe=TimeFrame.Minute,
+            start=datetime.combine(now.date() - timedelta(days=lookback_days * 3), time.min, tzinfo=timezone.utc),
+            end=now.astimezone(timezone.utc),
+            adjustment=self.backtester.adjustment,
+            feed=self.backtester.feed,
+        )
+        response = self.backtester.data.get_stock_bars(request)
+        raw_bars = getattr(response, "data", response)
+
+        result: dict[str, tuple[bool, str]] = {}
+        for symbol in symbols:
+            bars = [
+                bar
+                for bar in raw_bars.get(symbol, [])
+                if is_regular_session(bar.timestamp.astimezone(MARKET_TZ).time())
+            ]
+            if not bars:
+                result[symbol] = (False, "blocked: no intraday bars")
+                continue
+
+            bars_by_day: dict[date, list[Any]] = {}
+            for bar in bars:
+                local_date = bar.timestamp.astimezone(MARKET_TZ).date()
+                bars_by_day.setdefault(local_date, []).append(bar)
+            for day_bars in bars_by_day.values():
+                day_bars.sort(key=lambda item: item.timestamp)
+
+            today_bars = bars_by_day.get(now.date(), [])
+            if not today_bars:
+                result[symbol] = (False, "blocked: no bars for today")
+                continue
+            open_bar = next(
+                (bar for bar in today_bars if bar.timestamp.astimezone(MARKET_TZ).time() >= SESSION_OPEN),
+                None,
+            )
+            latest_bar = today_bars[-1]
+            if not open_bar or latest_bar.timestamp.astimezone(MARKET_TZ).time() < min_time:
+                result[symbol] = (False, f"blocked before entry filter start {min_time.strftime('%H:%M')}")
+                continue
+
+            open_price = float(open_bar.open)
+            current_price = float(latest_bar.close)
+            if open_price <= 0 or current_price <= 0:
+                result[symbol] = (False, "blocked: invalid open/current price")
+                continue
+
+            cumulative_bars = [
+                bar
+                for bar in today_bars
+                if SESSION_OPEN <= bar.timestamp.astimezone(MARKET_TZ).time() <= latest_bar.timestamp.astimezone(MARKET_TZ).time()
+            ]
+            vwap = calculate_vwap(
+                [
+                    _intraday_bar_like(
+                        timestamp=bar.timestamp.astimezone(MARKET_TZ),
+                        high=float(bar.high),
+                        low=float(bar.low),
+                        close=float(bar.close),
+                        volume=float(getattr(bar, "volume", 0.0) or 0.0),
+                    )
+                    for bar in cumulative_bars
+                ]
+            )
+            gain_from_open_pct = ((current_price / open_price) - 1) * 100
+            current_volume = sum(float(getattr(bar, "volume", 0.0) or 0.0) for bar in cumulative_bars)
+            average_volume = average_intraday_cumulative_volume(
+                bars_by_day=bars_by_day,
+                trading_day=now.date(),
+                cutoff=latest_bar.timestamp.astimezone(MARKET_TZ).time(),
+                lookback_days=lookback_days,
+            )
+            relative_volume = current_volume / average_volume if average_volume > 0 else 0.0
+
+            if bool(settings.get("require_above_open", True)) and current_price <= open_price:
+                result[symbol] = (
+                    False,
+                    f"blocked below open price=${current_price:.2f} open=${open_price:.2f}",
+                )
+                continue
+            if bool(settings.get("require_above_vwap", True)) and (vwap <= 0 or current_price <= vwap):
+                result[symbol] = (
+                    False,
+                    f"blocked below VWAP price=${current_price:.2f} vwap=${vwap:.2f}",
+                )
+                continue
+            if gain_from_open_pct < float(settings.get("min_open_gain_pct", 0.25)):
+                result[symbol] = (
+                    False,
+                    f"blocked weak open gain {gain_from_open_pct:.2f}% < {float(settings.get('min_open_gain_pct', 0.25)):.2f}%",
+                )
+                continue
+            if gain_from_open_pct > float(settings.get("max_open_gain_pct", 4.0)):
+                result[symbol] = (
+                    False,
+                    f"blocked too extended open gain {gain_from_open_pct:.2f}% > {float(settings.get('max_open_gain_pct', 4.0)):.2f}%",
+                )
+                continue
+            if relative_volume < float(settings.get("relative_volume_min", 1.2)):
+                result[symbol] = (
+                    False,
+                    f"blocked weak relative volume {relative_volume:.2f}x < {float(settings.get('relative_volume_min', 1.2)):.2f}x",
+                )
+                continue
+
+            result[symbol] = (
+                True,
+                f"entry ok price>${open_price:.2f} open, vwap=${vwap:.2f}, "
+                f"open_gain={gain_from_open_pct:.2f}%, rel_vol={relative_volume:.2f}x",
+            )
+
+        return result
+
     def load_training_frame(self, start: date, end: date) -> pd.DataFrame:
         fetch_start = start - timedelta(days=int(self.config["ml"]["feature_lookback_days"]) * 3)
         bars_by_symbol = self.backtester.fetch_daily_bars(self.config["watchlist"], fetch_start, end)
@@ -523,6 +753,45 @@ class MLStrategy:
         )
         frame = frame[(frame["date"] >= start) & (frame["date"] <= end)]
         return frame.sort_values(["date", "symbol"]).reset_index(drop=True)
+
+
+def parse_hhmm_time(value: str) -> time:
+    return datetime.strptime(value, "%H:%M").time()
+
+
+def _intraday_bar_like(
+    timestamp: datetime,
+    high: float,
+    low: float,
+    close: float,
+    volume: float,
+) -> LiveIntradayBar:
+    return LiveIntradayBar(
+        timestamp=timestamp,
+        high=high,
+        low=low,
+        close=close,
+        volume=volume,
+    )
+
+
+def average_intraday_cumulative_volume(
+    bars_by_day: dict[date, list[Any]],
+    trading_day: date,
+    cutoff: time,
+    lookback_days: int,
+) -> float:
+    volumes: list[float] = []
+    historical_days = sorted(day for day in bars_by_day if day < trading_day)[-lookback_days:]
+    for historical_day in historical_days:
+        cumulative_volume = sum(
+            float(getattr(bar, "volume", 0.0) or 0.0)
+            for bar in bars_by_day[historical_day]
+            if SESSION_OPEN <= bar.timestamp.astimezone(MARKET_TZ).time() <= cutoff
+        )
+        if cumulative_volume > 0:
+            volumes.append(cumulative_volume)
+    return sum(volumes) / len(volumes) if volumes else 0.0
 
 
 def build_feature_frame(

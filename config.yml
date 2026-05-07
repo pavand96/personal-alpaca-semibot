@@ -25,6 +25,11 @@ watchlist:
   - SNDK
   - GLW
   - WDC
+  - MSFT
+  - GOOGL
+  - AMZN
+  - TSLA
+  - META
 
 strategy:
   # Buy when latest trade is this much above the previous daily close.
@@ -39,12 +44,61 @@ strategy:
 
 risk:
   # Dry run prints/logs intended orders but does not submit them.
-  dry_run: true
+  dry_run: false
   require_market_open: true
   max_orders_per_run: 3
-  stop_loss_pct: 8.0
+  stop_loss_pct: 0.5
   trailing_stop_pct: 25.0
   max_account_drawdown_pct: 15.0
+  max_total_position_notional: 10000.0
+  take_profit_pct: 1.0
+  exit_before_close: "15:55"
+
+live_entry_filter:
+  enabled: true
+  min_time: "09:45"
+  require_above_open: true
+  require_above_vwap: true
+  min_open_gain_pct: 0.25
+  max_open_gain_pct: 4.0
+  relative_volume_min: 1.2
+  average_volume_lookback_days: 20
+
+portfolio:
+  correlation_sizing_enabled: true
+  correlation_lookback_days: 60
+  high_correlation_threshold: 0.75
+  high_correlation_notional_multiplier: 0.5
+  very_high_correlation_threshold: 0.90
+  very_high_correlation_notional_multiplier: 0.25
+  min_correlation_adjusted_notional: 50.0
+
+news_hold:
+  enabled: true
+  lookback_hours: 24
+  limit_per_symbol: 5
+  hold_on_any_recent_news: false
+  fail_closed: false
+  block_keywords:
+    - accounting probe
+    - bankruptcy
+    - class action
+    - cuts guidance
+    - data breach
+    - delisting
+    - downgrade
+    - fraud
+    - guidance cut
+    - investigation
+    - lawsuit
+    - misses estimates
+    - probe
+    - recall
+    - resigns
+    - sec investigation
+    - short report
+    - slashes forecast
+    - subpoena
 
 runtime:
   interval_seconds: 300
@@ -100,3 +154,39 @@ intraday:
   stop_loss_pct: 0.5
   take_profit_pct: 1.0
   trades_file: logs/intraday_backtest_trades.csv
+
+sector_allocator:
+  entry_time: "10:00"
+  exit_time: "15:55"
+  sector_lookback_days: 5
+  min_sector_lookback_return_pct: 0.5
+  max_symbols_per_day: 1
+  base_notional: 9500.0
+  max_notional_per_trade: 9500.0
+  max_total_notional: 9500.0
+  min_open_gain_pct: 0.25
+  max_open_gain_pct: 5.0
+  relative_volume_min: 1.2
+  average_volume_lookback_days: 20
+  stop_loss_pct: 3.0
+  first_take_profit_pct: 1.0
+  final_take_profit_pct: 8.0
+  partial_exit_fraction: 0.5
+  trades_file: logs/sector_allocator_trades.csv
+
+sector_swing_allocator:
+  sector_lookback_days: 5
+  min_sector_return_pct: 0.5
+  momentum_lookback_days: 20
+  fast_momentum_days: 5
+  min_symbol_momentum_pct: 0.0
+  max_symbols: 1
+  max_total_exposure: 9500.0
+  rebalance_days: 3
+  trailing_stop_pct: 20.0
+  trades_file: logs/sector_swing_trades.csv
+
+sector_balanced_allocator:
+  core_swing_exposure: 5000.0
+  confirmed_intraday_exposure: 4500.0
+  exposure_usage_pct: 0.95

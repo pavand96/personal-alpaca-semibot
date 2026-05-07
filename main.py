@@ -8,6 +8,10 @@ from datetime import date
 from dotenv import load_dotenv
 
 from semibot.backtest import Backtester, print_backtest_result, write_trades_csv
+from semibot.balanced_allocator import (
+    BalancedSectorAllocatorBacktester,
+    print_balanced_allocator_result,
+)
 from semibot.bot import SemiMomentumBot
 from semibot.config import load_config
 from semibot.intraday import (
@@ -22,6 +26,16 @@ from semibot.ml import (
     print_optimization_results,
     print_training_result,
 )
+from semibot.sector_allocator import (
+    SectorMomentumAllocatorBacktester,
+    print_sector_allocator_result,
+    write_sector_allocator_trades,
+)
+from semibot.swing_allocator import (
+    SectorSwingAllocatorBacktester,
+    print_sector_swing_result,
+    write_sector_swing_trades,
+)
 
 
 def main() -> None:
@@ -34,6 +48,9 @@ def main() -> None:
             "run",
             "backtest",
             "intraday-backtest",
+            "sector-allocator-backtest",
+            "sector-balanced-backtest",
+            "sector-swing-backtest",
             "train-model",
             "ml-backtest",
             "kelly-analysis",
@@ -63,6 +80,9 @@ def main() -> None:
     if args.command in {
         "backtest",
         "intraday-backtest",
+        "sector-allocator-backtest",
+        "sector-balanced-backtest",
+        "sector-swing-backtest",
         "train-model",
         "ml-backtest",
         "kelly-analysis",
@@ -91,6 +111,37 @@ def main() -> None:
         print_intraday_result(result)
         write_intraday_trades_csv(config["intraday"]["trades_file"], result.trades)
         print(f"\nIntraday trade history written to {config['intraday']['trades_file']}")
+        return
+
+    if args.command == "sector-allocator-backtest":
+        result = SectorMomentumAllocatorBacktester(
+            config,
+            api_key=api_key,
+            secret_key=secret_key,
+        ).run(start=start, end=end)
+        print_sector_allocator_result(result)
+        write_sector_allocator_trades(config["sector_allocator"]["trades_file"], result.trades)
+        print(f"\nSector allocator trade history written to {config['sector_allocator']['trades_file']}")
+        return
+
+    if args.command == "sector-balanced-backtest":
+        result = BalancedSectorAllocatorBacktester(
+            config,
+            api_key=api_key,
+            secret_key=secret_key,
+        ).run(start=start, end=end)
+        print_balanced_allocator_result(result)
+        return
+
+    if args.command == "sector-swing-backtest":
+        result = SectorSwingAllocatorBacktester(
+            config,
+            api_key=api_key,
+            secret_key=secret_key,
+        ).run(start=start, end=end)
+        print_sector_swing_result(result)
+        write_sector_swing_trades(config["sector_swing_allocator"]["trades_file"], result.trades)
+        print(f"\nSector swing trade history written to {config['sector_swing_allocator']['trades_file']}")
         return
 
     if args.command == "train-model":
