@@ -1,0 +1,42 @@
+[project]
+name = "personal-alpaca-semibot"
+version = "0.1.0"
+description = "Paper-first Alpaca trading research bot for semiconductor and momentum strategies."
+requires-python = ">=3.11"
+dependencies = [
+    "alpaca-py>=0.42.0",
+    "joblib>=1.4.2",
+    "numpy>=1.26.4",
+    "pandas>=2.2.2",
+    "python-dotenv>=1.0.1",
+    "PyYAML>=6.0.2",
+    "scikit-learn>=1.4.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2",
+    "ruff>=0.4",
+    "mypy>=1.10",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.setuptools.packages.find]
+include = ["semibot*"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true

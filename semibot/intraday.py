@@ -7,14 +7,12 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from alpaca.data.enums import Adjustment
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
 from semibot.backtest import parse_adjustment
 from semibot.bot import parse_data_feed
-
 
 MARKET_TZ = ZoneInfo("America/New_York")
 SESSION_OPEN = time(9, 30)

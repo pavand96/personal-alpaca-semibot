@@ -2,13 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from typing import Any
 
 from semibot.backtest import (
+    Backtester,
     BacktestPosition,
     BacktestResult,
     BacktestTrade,
-    Backtester,
     DailyBar,
     apply_slippage,
     market_value,

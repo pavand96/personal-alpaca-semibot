@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, time, timedelta
 from pathlib import Path
 from typing import Any
 
 from semibot.intraday import (
+    SESSION_OPEN,
     IntradayBar,
     IntradayOpeningMomentumBacktester,
     IntradayTrade,
@@ -15,7 +16,6 @@ from semibot.intraday import (
     parse_clock,
     print_intraday_result,
     write_intraday_trades_csv,
-    SESSION_OPEN,
 )
 
 

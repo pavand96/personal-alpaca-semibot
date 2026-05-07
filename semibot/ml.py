@@ -11,10 +11,9 @@ from typing import Any
 import joblib
 import numpy as np
 import pandas as pd
+from alpaca.data.historical import NewsClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
-from alpaca.data.historical import NewsClient
-from alpaca.data.requests import NewsRequest
 from sklearn.base import clone
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
@@ -25,17 +24,15 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 from semibot.backtest import (
+    Backtester,
     BacktestPosition,
     BacktestResult,
     BacktestTrade,
-    Backtester,
     DailyBar,
-    apply_slippage,
     market_value,
 )
 from semibot.bot import Decision, SemiMomentumBot, format_decision
 from semibot.intraday import MARKET_TZ, SESSION_OPEN, calculate_vwap, is_regular_session
-
 
 NUMERIC_FEATURES = [
     "return_1d",
@@ -759,6 +756,53 @@ def parse_hhmm_time(value: str) -> time:
     return datetime.strptime(value, "%H:%M").time()
 
 
+def correlation_adjusted_notional(
+    symbol: str,
+    base_notional: float,
+    held_symbols: list[str],
+    bars_by_symbol: dict[str, list[DailyBar]],
+    as_of_date: date,
+    settings: dict[str, Any],
+) -> float:
+    if not settings.get("correlation_sizing_enabled", True) or not held_symbols:
+        return base_notional
+
+    lookback_days = int(settings.get("correlation_lookback_days", 60))
+    candidate_returns = recent_daily_returns(bars_by_symbol.get(symbol, []), as_of_date, lookback_days)
+    if len(candidate_returns) < 2:
+        return base_notional
+
+    max_correlation = 0.0
+    for held_symbol in held_symbols:
+        held_returns = recent_daily_returns(bars_by_symbol.get(held_symbol, []), as_of_date, lookback_days)
+        sample_size = min(len(candidate_returns), len(held_returns))
+        if sample_size < 2:
+            continue
+        correlation = float(np.corrcoef(candidate_returns[-sample_size:], held_returns[-sample_size:])[0, 1])
+        if np.isfinite(correlation):
+            max_correlation = max(max_correlation, correlation)
+
+    multiplier = 1.0
+    if max_correlation >= float(settings.get("very_high_correlation_threshold", 0.90)):
+        multiplier = float(settings.get("very_high_correlation_notional_multiplier", 0.25))
+    elif max_correlation >= float(settings.get("high_correlation_threshold", 0.75)):
+        multiplier = float(settings.get("high_correlation_notional_multiplier", 0.5))
+
+    adjusted = base_notional * multiplier
+    minimum = float(settings.get("min_correlation_adjusted_notional", 50.0))
+    return adjusted if adjusted >= minimum else 0.0
+
+
+def recent_daily_returns(bars: list[DailyBar], as_of_date: date, lookback_days: int) -> list[float]:
+    prior_bars = [bar for bar in bars if bar.timestamp.date() <= as_of_date]
+    prior_bars = prior_bars[-(lookback_days + 1):]
+    returns: list[float] = []
+    for previous, current in zip(prior_bars, prior_bars[1:], strict=False):
+        if previous.close > 0:
+            returns.append((current.close / previous.close) - 1)
+    return returns
+
+
 def _intraday_bar_like(
     timestamp: datetime,
     high: float,
@@ -867,7 +911,7 @@ def predict_rows(artifact: dict[str, Any], rows: pd.DataFrame) -> list[MLSignal]
         return []
     probabilities = artifact["estimator"].predict_proba(rows[MODEL_FEATURES])[:, 1]
     signals: list[MLSignal] = []
-    for (_, row), probability in zip(rows.iterrows(), probabilities):
+    for (_, row), probability in zip(rows.iterrows(), probabilities, strict=False):
         action = "buy" if probability >= 0.5 else "avoid"
         signals.append(
             MLSignal(

@@ -5,3 +5,4 @@ __pycache__/
 logs/
 hide_key.txt
 models/
+*.egg-info/
