@@ -1,4 +1,8 @@
-from semibot.bot import MarketView, SemiMomentumBot
+from types import SimpleNamespace
+
+import pytest
+
+from semibot.bot import MarketView, SemiMomentumBot, account_daily_return_pct
 
 
 def make_bot() -> SemiMomentumBot:
@@ -50,3 +54,9 @@ def test_decide_holds_when_position_cap_reached() -> None:
 
     assert decisions[0].action == "hold"
     assert "max position" in decisions[0].reason
+
+
+def test_account_daily_return_pct_uses_last_equity() -> None:
+    account = SimpleNamespace(equity="9700", last_equity="10000")
+
+    assert account_daily_return_pct(account) == pytest.approx(-3.0)

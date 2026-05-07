@@ -66,7 +66,19 @@ class SemiMomentumBot:
 
         dry_run = bool(self.config["risk"]["dry_run"]) or not execute
         max_orders = int(self.config["risk"]["max_orders_per_run"])
-        decisions = self.decide(self.get_market_views())
+        if self.daily_loss_kill_switch_triggered():
+            positions = self.get_positions()
+            if self.config["risk"].get("flatten_on_daily_loss", True):
+                decisions = [
+                    Decision(position.symbol, "sell", "daily loss kill switch", qty=float(position.qty))
+                    for position in positions.values()
+                    if float(position.qty) > 0
+                ]
+            else:
+                print("Daily loss kill switch active. No orders submitted.")
+                return []
+        else:
+            decisions = self.decide(self.get_market_views())
 
         submitted: list[Decision] = []
         for decision in decisions:
@@ -203,6 +215,20 @@ class SemiMomentumBot:
         if getattr(account, "account_blocked", False):
             raise RuntimeError("Alpaca account is account blocked")
 
+    def daily_loss_kill_switch_triggered(self) -> bool:
+        max_daily_loss_pct = float(self.config["risk"].get("max_daily_loss_pct", 0.0))
+        if max_daily_loss_pct <= 0:
+            return False
+        account = self.trading.get_account()
+        daily_return_pct = account_daily_return_pct(account)
+        if daily_return_pct <= -max_daily_loss_pct:
+            print(
+                f"Daily loss kill switch active: account daily return "
+                f"{daily_return_pct:.2f}% <= -{max_daily_loss_pct:.2f}%"
+            )
+            return True
+        return False
+
     def log_view(self, view: MarketView) -> None:
         append_event(
             self.config["runtime"]["log_file"],
@@ -246,3 +272,11 @@ def format_decision(decision: Decision) -> str:
     else:
         size = f"{decision.qty:g} shares"
     return f"{decision.action.upper()} {decision.symbol} {size}: {decision.reason}"
+
+
+def account_daily_return_pct(account: Any) -> float:
+    equity = float(getattr(account, "equity", 0.0) or 0.0)
+    last_equity = float(getattr(account, "last_equity", 0.0) or 0.0)
+    if last_equity <= 0:
+        return 0.0
+    return ((equity / last_equity) - 1) * 100

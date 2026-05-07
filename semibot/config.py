@@ -54,6 +54,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "stop_loss_pct": 0.5,
         "trailing_stop_pct": 15.0,
         "max_account_drawdown_pct": 15.0,
+        "max_daily_loss_pct": 3.0,
+        "flatten_on_daily_loss": True,
         "max_total_position_notional": 10000.0,
         "take_profit_pct": 1.0,
         "exit_before_close": "15:55",
@@ -258,6 +260,7 @@ def validate_config(config: dict[str, Any]) -> None:
         "stop_loss_pct",
         "trailing_stop_pct",
         "max_account_drawdown_pct",
+        "max_daily_loss_pct",
         "max_total_position_notional",
         "take_profit_pct",
     ]:

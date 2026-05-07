@@ -479,6 +479,22 @@ class MLStrategy:
             return []
 
         positions = bot.get_positions()
+        if bot.daily_loss_kill_switch_triggered():
+            if self.config["risk"].get("flatten_on_daily_loss", True):
+                decisions = [
+                    Decision(position.symbol, "sell", "daily loss kill switch", qty=float(position.qty))
+                    for position in positions.values()
+                    if float(position.qty) > 0
+                ]
+                return submit_ml_decisions(
+                    bot=bot,
+                    decisions=decisions,
+                    dry_run=bool(self.config["risk"]["dry_run"]) or not execute,
+                    max_orders=int(self.config["risk"]["max_orders_per_run"]),
+                )
+            print("Daily loss kill switch active. No ML orders submitted.")
+            return []
+
         dry_run = bool(self.config["risk"]["dry_run"]) or not execute
         max_orders = int(self.config["risk"]["max_orders_per_run"])
         per_trade_notional = float(self.config["strategy"]["per_trade_notional"])
@@ -590,21 +606,7 @@ class MLStrategy:
                     )
                 )
 
-        submitted: list[Decision] = []
-        for decision in decisions:
-            if len(submitted) >= max_orders:
-                break
-            if decision.action == "hold":
-                print(f"ML HOLD {format_decision(decision)}")
-                bot.log_decision(decision, event="ml_hold")
-                continue
-            if dry_run:
-                print(f"ML DRY RUN {format_decision(decision)}")
-                bot.log_decision(decision, event="ml_dry_run_order")
-            else:
-                bot.submit_order(decision)
-                bot.log_decision(decision, event="ml_submitted_order")
-            submitted.append(decision)
+        submitted = submit_ml_decisions(bot=bot, decisions=decisions, dry_run=dry_run, max_orders=max_orders)
 
         if not submitted:
             print("No ML trade signals crossed the configured probability thresholds.")
@@ -754,6 +756,30 @@ class MLStrategy:
 
 def parse_hhmm_time(value: str) -> time:
     return datetime.strptime(value, "%H:%M").time()
+
+
+def submit_ml_decisions(
+    bot: SemiMomentumBot,
+    decisions: list[Decision],
+    dry_run: bool,
+    max_orders: int,
+) -> list[Decision]:
+    submitted: list[Decision] = []
+    for decision in decisions:
+        if len(submitted) >= max_orders:
+            break
+        if decision.action == "hold":
+            print(f"ML HOLD {format_decision(decision)}")
+            bot.log_decision(decision, event="ml_hold")
+            continue
+        if dry_run:
+            print(f"ML DRY RUN {format_decision(decision)}")
+            bot.log_decision(decision, event="ml_dry_run_order")
+        else:
+            bot.submit_order(decision)
+            bot.log_decision(decision, event="ml_submitted_order")
+        submitted.append(decision)
+    return submitted
 
 
 def correlation_adjusted_notional(
