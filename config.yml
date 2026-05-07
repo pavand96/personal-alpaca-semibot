@@ -88,3 +88,15 @@ ml:
   max_symbols_to_buy_per_run_grid: [2, 3]
   stop_loss_pct_grid: [6.0, 8.0, 10.0]
   trailing_stop_pct_grid: [12.0, 18.0, 25.0]
+
+intraday:
+  entry_time: "09:45"
+  exit_time: "15:55"
+  per_trade_notional: 250.0
+  min_open_gain_pct: 1.0
+  max_open_gain_pct: 4.0
+  relative_volume_min: 1.5
+  average_volume_lookback_days: 20
+  stop_loss_pct: 0.5
+  take_profit_pct: 1.0
+  trades_file: logs/intraday_backtest_trades.csv

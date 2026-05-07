@@ -10,6 +10,11 @@ from dotenv import load_dotenv
 from semibot.backtest import Backtester, print_backtest_result, write_trades_csv
 from semibot.bot import SemiMomentumBot
 from semibot.config import load_config
+from semibot.intraday import (
+    IntradayOpeningMomentumBacktester,
+    print_intraday_result,
+    write_intraday_trades_csv,
+)
 from semibot.ml import MLStrategy, print_ml_signals, print_optimization_results, print_training_result
 
 
@@ -22,6 +27,7 @@ def main() -> None:
             "trade-once",
             "run",
             "backtest",
+            "intraday-backtest",
             "train-model",
             "ml-backtest",
             "optimize-ml-params",
@@ -47,7 +53,7 @@ def main() -> None:
 
     config = load_config(args.config)
 
-    if args.command in {"backtest", "train-model", "ml-backtest", "optimize-ml-params"}:
+    if args.command in {"backtest", "intraday-backtest", "train-model", "ml-backtest", "optimize-ml-params"}:
         if not args.start:
             raise SystemExit(f"{args.command} requires --start YYYY-MM-DD")
         start = date.fromisoformat(args.start)
@@ -60,6 +66,17 @@ def main() -> None:
         print_backtest_result(result)
         write_trades_csv(config["backtest"]["trades_file"], result.trades)
         print(f"\nTrade history written to {config['backtest']['trades_file']}")
+        return
+
+    if args.command == "intraday-backtest":
+        result = IntradayOpeningMomentumBacktester(
+            config,
+            api_key=api_key,
+            secret_key=secret_key,
+        ).run(start=start, end=end)
+        print_intraday_result(result)
+        write_intraday_trades_csv(config["intraday"]["trades_file"], result.trades)
+        print(f"\nIntraday trade history written to {config['intraday']['trades_file']}")
         return
 
     if args.command == "train-model":

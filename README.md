@@ -42,6 +42,16 @@ This downloads historical daily bars from Alpaca and simulates the configured mo
 
 The backtest also compares the result against semiconductor stock buy-and-hold benchmarks. By default it includes an equal-weight basket of the configured watchlist (`SEMIS_EQ`) and each watchlist stock individually.
 
+## Intraday Opening Momentum
+
+Backtest the 9:45 AM opening-momentum rule:
+
+```bash
+python main.py intraday-backtest --start 2025-11-07 --end 2026-05-07
+```
+
+The rule buys at 9:45 AM only when price is at least 1% above the open, above VWAP, relative cumulative volume is above 1.5x the prior 20-day average for the same time window, and the move from open is not already above 4%. It uses a 0.5% stop loss, 1.0% take profit, exits by 3:55 PM, and allows at most one trade per symbol per day.
+
 ## Machine Learning
 
 Train a model on historical daily bars:
