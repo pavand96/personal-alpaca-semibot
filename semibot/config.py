@@ -206,6 +206,7 @@ def load_config(path: str | Path) -> dict[str, Any]:
     config["watchlist"] = normalize_symbols(config.get("watchlist", []))
     benchmark_symbols = config["backtest"].get("benchmark_symbols", [])
     config["backtest"]["benchmark_symbols"] = normalize_symbols(benchmark_symbols, allow_empty=True)
+    validate_config(config)
     return config
 
 
@@ -236,3 +237,87 @@ def normalize_symbols(symbols: list[Any], allow_empty: bool = False) -> list[str
         raise ValueError("watchlist must contain at least one symbol")
 
     return normalized
+
+
+def validate_config(config: dict[str, Any]) -> None:
+    if not bool(config["alpaca"].get("paper", True)) and not bool(config["risk"].get("dry_run", True)):
+        raise ValueError("refusing to load config with alpaca.paper=false and risk.dry_run=false")
+
+    require_positive(config["strategy"], "per_trade_notional")
+    require_positive(config["strategy"], "max_position_notional")
+    if float(config["strategy"]["per_trade_notional"]) > float(config["strategy"]["max_position_notional"]):
+        raise ValueError("strategy.per_trade_notional cannot exceed strategy.max_position_notional")
+    require_non_negative(config["strategy"], "max_symbols_to_buy_per_run")
+    require_positive(config["strategy"], "min_price")
+    require_positive(config["strategy"], "max_price")
+    if float(config["strategy"]["min_price"]) > float(config["strategy"]["max_price"]):
+        raise ValueError("strategy.min_price cannot exceed strategy.max_price")
+
+    for key in [
+        "max_orders_per_run",
+        "stop_loss_pct",
+        "trailing_stop_pct",
+        "max_account_drawdown_pct",
+        "max_total_position_notional",
+        "take_profit_pct",
+    ]:
+        require_positive(config["risk"], key)
+    validate_hhmm(config["risk"], "exit_before_close")
+
+    validate_hhmm(config["live_entry_filter"], "min_time")
+    require_non_negative(config["live_entry_filter"], "min_open_gain_pct")
+    require_positive(config["live_entry_filter"], "max_open_gain_pct")
+    if float(config["live_entry_filter"]["min_open_gain_pct"]) > float(config["live_entry_filter"]["max_open_gain_pct"]):
+        raise ValueError("live_entry_filter.min_open_gain_pct cannot exceed max_open_gain_pct")
+    require_positive(config["live_entry_filter"], "relative_volume_min")
+    require_positive(config["live_entry_filter"], "average_volume_lookback_days")
+
+    require_positive(config["backtest"], "initial_cash")
+    require_non_negative(config["backtest"], "slippage_bps")
+
+    for section_name in ["intraday", "sector_allocator"]:
+        section = config[section_name]
+        validate_hhmm(section, "entry_time")
+        validate_hhmm(section, "exit_time")
+        if str(section["entry_time"]) >= str(section["exit_time"]):
+            raise ValueError(f"{section_name}.entry_time must be before exit_time")
+        require_positive(section, "relative_volume_min")
+        require_positive(section, "average_volume_lookback_days")
+        require_non_negative(section, "min_open_gain_pct")
+        require_positive(section, "max_open_gain_pct")
+        if float(section["min_open_gain_pct"]) > float(section["max_open_gain_pct"]):
+            raise ValueError(f"{section_name}.min_open_gain_pct cannot exceed max_open_gain_pct")
+        require_positive(section, "stop_loss_pct")
+        require_positive(section, "take_profit_pct" if section_name == "intraday" else "first_take_profit_pct")
+
+    balanced = config["sector_balanced_allocator"]
+    require_non_negative(balanced, "core_swing_exposure")
+    require_non_negative(balanced, "confirmed_intraday_exposure")
+    require_positive(balanced, "exposure_usage_pct")
+    if float(balanced["exposure_usage_pct"]) > 1.0:
+        raise ValueError("sector_balanced_allocator.exposure_usage_pct cannot exceed 1.0")
+    total_exposure = float(balanced["core_swing_exposure"]) + float(balanced["confirmed_intraday_exposure"])
+    if total_exposure > float(config["backtest"]["initial_cash"]):
+        raise ValueError("sector_balanced_allocator exposures cannot exceed backtest.initial_cash")
+
+
+def require_positive(section: dict[str, Any], key: str) -> None:
+    if float(section[key]) <= 0:
+        raise ValueError(f"{key} must be positive")
+
+
+def require_non_negative(section: dict[str, Any], key: str) -> None:
+    if float(section[key]) < 0:
+        raise ValueError(f"{key} cannot be negative")
+
+
+def validate_hhmm(section: dict[str, Any], key: str) -> None:
+    value = str(section[key])
+    try:
+        hour, minute = value.split(":", maxsplit=1)
+        hour_int = int(hour)
+        minute_int = int(minute)
+    except ValueError as error:
+        raise ValueError(f"{key} must be HH:MM") from error
+    if not 0 <= hour_int <= 23 or not 0 <= minute_int <= 59:
+        raise ValueError(f"{key} must be HH:MM")
