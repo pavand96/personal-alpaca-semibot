@@ -42,6 +42,40 @@ This downloads historical daily bars from Alpaca and simulates the configured mo
 
 The backtest also compares the result against configurable buy-and-hold benchmarks. Defaults are `SMH`, `SOXX`, `QQQ`, and `SPY`.
 
+## Machine Learning
+
+Train a model on historical daily bars:
+
+```bash
+python main.py train-model --start 2020-01-01 --end 2025-01-01
+```
+
+The trainer builds daily momentum, volatility, moving-average, range, volume, and symbol features, then validates them with time-ordered splits. The saved model is written to `models/semibot_model.joblib`.
+
+Backtest the saved model on later dates:
+
+```bash
+python main.py ml-backtest --start 2025-01-01 --end 2026-05-01
+```
+
+Inspect the latest model probabilities:
+
+```bash
+python main.py ml-signal
+```
+
+Run a dry-run ML trading check:
+
+```bash
+python main.py ml-trade-once
+```
+
+To allow paper orders, keep `alpaca.paper: true`, set `risk.dry_run: false`, and pass `--execute`:
+
+```bash
+python main.py ml-trade-once --execute
+```
+
 ## Continuous Daily Monitoring
 
 ```bash

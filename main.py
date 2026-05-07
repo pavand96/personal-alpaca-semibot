@@ -10,11 +10,24 @@ from dotenv import load_dotenv
 from semibot.backtest import Backtester, print_backtest_result, write_trades_csv
 from semibot.bot import SemiMomentumBot
 from semibot.config import load_config
+from semibot.ml import MLStrategy, print_ml_signals, print_training_result
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Alpaca semiconductor momentum monitor/trader")
-    parser.add_argument("command", choices=["monitor", "trade-once", "run", "backtest"])
+    parser.add_argument(
+        "command",
+        choices=[
+            "monitor",
+            "trade-once",
+            "run",
+            "backtest",
+            "train-model",
+            "ml-backtest",
+            "ml-signal",
+            "ml-trade-once",
+        ],
+    )
     parser.add_argument("--config", default="config.yml", help="Path to YAML config")
     parser.add_argument("--start", help="Backtest start date, YYYY-MM-DD")
     parser.add_argument("--end", help="Backtest end date, YYYY-MM-DD. Defaults to today.")
@@ -33,18 +46,46 @@ def main() -> None:
 
     config = load_config(args.config)
 
-    if args.command == "backtest":
+    if args.command in {"backtest", "train-model", "ml-backtest"}:
         if not args.start:
-            raise SystemExit("Backtest requires --start YYYY-MM-DD")
+            raise SystemExit(f"{args.command} requires --start YYYY-MM-DD")
         start = date.fromisoformat(args.start)
         end = date.fromisoformat(args.end) if args.end else date.today()
         if end <= start:
             raise SystemExit("--end must be after --start")
 
+    if args.command == "backtest":
         result = Backtester(config, api_key=api_key, secret_key=secret_key).run(start=start, end=end)
         print_backtest_result(result)
         write_trades_csv(config["backtest"]["trades_file"], result.trades)
         print(f"\nTrade history written to {config['backtest']['trades_file']}")
+        return
+
+    if args.command == "train-model":
+        result = MLStrategy(config, api_key=api_key, secret_key=secret_key).train(start=start, end=end)
+        print_training_result(result)
+        return
+
+    if args.command == "ml-backtest":
+        result = MLStrategy(config, api_key=api_key, secret_key=secret_key).ml_backtest(start=start, end=end)
+        print("ML backtest")
+        print_backtest_result(result)
+        write_trades_csv(config["ml"]["ml_trades_file"], result.trades)
+        print(f"\nML trade history written to {config['ml']['ml_trades_file']}")
+        return
+
+    if args.command == "ml-signal":
+        strategy = MLStrategy(config, api_key=api_key, secret_key=secret_key)
+        signals = strategy.latest_signals()
+        print_ml_signals(
+            signals,
+            buy_probability=float(config["ml"]["buy_probability"]),
+            sell_probability=float(config["ml"]["sell_probability"]),
+        )
+        return
+
+    if args.command == "ml-trade-once":
+        MLStrategy(config, api_key=api_key, secret_key=secret_key).ml_trade_once(execute=args.execute)
         return
 
     bot = SemiMomentumBot(config, api_key=api_key, secret_key=secret_key)

@@ -39,6 +39,19 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "liquidate_at_end": True,
         "trades_file": "logs/backtest_trades.csv",
     },
+    "ml": {
+        "model_path": "models/semibot_model.joblib",
+        "model_type": "logistic_regression",
+        "horizon_days": 3,
+        "target_return_pct": 1.0,
+        "buy_probability": 0.60,
+        "sell_probability": 0.40,
+        "feature_lookback_days": 30,
+        "validation_splits": 5,
+        "validation_gap_days": 1,
+        "random_state": 42,
+        "ml_trades_file": "logs/ml_backtest_trades.csv",
+    },
 }
 
 

@@ -19,7 +19,10 @@ class DailyBar:
     symbol: str
     timestamp: datetime
     open: float
+    high: float
+    low: float
     close: float
+    volume: float
 
 
 @dataclass
@@ -244,7 +247,10 @@ class Backtester:
                         symbol=symbol,
                         timestamp=bar.timestamp,
                         open=float(bar.open),
+                        high=float(bar.high),
+                        low=float(bar.low),
                         close=float(bar.close),
+                        volume=float(getattr(bar, "volume", 0.0) or 0.0),
                     )
                 )
 

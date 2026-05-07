@@ -4,3 +4,4 @@ __pycache__/
 *.py[cod]
 logs/
 hide_key.txt
+models/
