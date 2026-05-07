@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import csv
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from itertools import product
 from pathlib import Path
 from typing import Any
 
@@ -83,6 +86,16 @@ class TrainingResult:
     model_path: str
 
 
+@dataclass(frozen=True)
+class OptimizationResult:
+    score: float
+    total_return_pct: float
+    max_drawdown_pct: float
+    trades: int
+    feasible: bool
+    params: dict[str, Any]
+
+
 class MLStrategy:
     def __init__(self, config: dict[str, Any], api_key: str, secret_key: str) -> None:
         self.config = config
@@ -156,6 +169,9 @@ class MLStrategy:
         buy_probability = float(ml_settings["buy_probability"])
         sell_probability = float(ml_settings["sell_probability"])
         slippage_bps = float(settings["slippage_bps"])
+        stop_loss_pct = float(self.config["risk"]["stop_loss_pct"])
+        trailing_stop_pct = float(self.config["risk"]["trailing_stop_pct"])
+        max_account_drawdown_pct = float(self.config["risk"]["max_account_drawdown_pct"])
 
         peak_equity = starting_cash
         max_drawdown_pct = 0.0
@@ -193,15 +209,40 @@ class MLStrategy:
             if peak_equity > 0:
                 drawdown_pct = ((equity - peak_equity) / peak_equity) * 100
                 max_drawdown_pct = min(max_drawdown_pct, drawdown_pct)
+            account_drawdown_pct = abs(min(0.0, ((equity - peak_equity) / peak_equity) * 100)) if peak_equity else 0.0
+
+            update_position_peaks(positions, today_bars)
+            risk_signals = risk_exit_signals(
+                positions=positions,
+                bars=today_bars,
+                stop_loss_pct=stop_loss_pct,
+                trailing_stop_pct=trailing_stop_pct,
+            )
+            if account_drawdown_pct >= max_account_drawdown_pct:
+                risk_signals.extend(
+                    {
+                        "symbol": symbol,
+                        "action": "sell",
+                        "qty": position.qty,
+                        "reason": f"account drawdown {account_drawdown_pct:.2f}% >= limit {max_account_drawdown_pct:.2f}%",
+                    }
+                    for symbol, position in positions.items()
+                    if position.qty > 0
+                )
+                pending_signals = dedupe_sell_signals(risk_signals)
+                continue
 
             feature_rows = feature_rows_for_date(bars_by_symbol, current_date)
             if not feature_rows:
                 continue
             predictions = predict_rows(artifact, pd.DataFrame(feature_rows))
 
-            signals: list[dict[str, Any]] = []
+            signals: list[dict[str, Any]] = list(risk_signals)
+            risk_sell_symbols = {signal["symbol"] for signal in risk_signals}
             buys_used = 0
             for signal in sorted(predictions, key=lambda item: item.probability, reverse=True):
+                if signal.symbol in risk_sell_symbols:
+                    continue
                 position = positions[signal.symbol]
                 held_value = position.qty * signal.price
                 if signal.price < min_price or signal.price > max_price:
@@ -265,6 +306,85 @@ class MLStrategy:
             benchmarks=benchmarks,
         )
 
+    def optimize_parameters(self, start: date, end: date) -> list[OptimizationResult]:
+        ml_settings = self.config["ml"]
+        max_trials = int(ml_settings["optimizer_max_trials"])
+        drawdown_penalty = float(ml_settings["optimizer_return_drawdown_penalty"])
+        trade_penalty = float(ml_settings["optimizer_trade_penalty"])
+        max_allowed_drawdown = float(self.config["risk"]["max_account_drawdown_pct"])
+
+        grid = product(
+            ml_settings["buy_probability_grid"],
+            ml_settings["sell_probability_grid"],
+            ml_settings["per_trade_notional_grid"],
+            ml_settings["max_position_notional_grid"],
+            ml_settings["max_symbols_to_buy_per_run_grid"],
+            ml_settings["stop_loss_pct_grid"],
+            ml_settings["trailing_stop_pct_grid"],
+        )
+
+        results: list[OptimizationResult] = []
+        for index, (
+            buy_probability,
+            sell_probability,
+            per_trade_notional,
+            max_position_notional,
+            max_symbols_to_buy_per_run,
+            stop_loss_pct,
+            trailing_stop_pct,
+        ) in enumerate(grid, start=1):
+            if index > max_trials:
+                break
+            if float(sell_probability) >= float(buy_probability):
+                continue
+            if float(per_trade_notional) > float(max_position_notional):
+                continue
+
+            trial_config = deepcopy(self.config)
+            trial_config["ml"]["buy_probability"] = float(buy_probability)
+            trial_config["ml"]["sell_probability"] = float(sell_probability)
+            trial_config["strategy"]["per_trade_notional"] = float(per_trade_notional)
+            trial_config["strategy"]["max_position_notional"] = float(max_position_notional)
+            trial_config["strategy"]["max_symbols_to_buy_per_run"] = int(max_symbols_to_buy_per_run)
+            trial_config["risk"]["stop_loss_pct"] = float(stop_loss_pct)
+            trial_config["risk"]["trailing_stop_pct"] = float(trailing_stop_pct)
+
+            result = MLStrategy(trial_config, api_key=self.api_key, secret_key=self.secret_key).ml_backtest(
+                start=start,
+                end=end,
+            )
+            feasible = abs(result.max_drawdown_pct) <= max_allowed_drawdown
+            score = (
+                result.total_return_pct
+                + drawdown_penalty * result.max_drawdown_pct
+                - trade_penalty * (len(result.trades) / 100)
+            )
+            if not feasible:
+                score -= 1000
+
+            results.append(
+                OptimizationResult(
+                    score=score,
+                    total_return_pct=result.total_return_pct,
+                    max_drawdown_pct=result.max_drawdown_pct,
+                    trades=len(result.trades),
+                    feasible=feasible,
+                    params={
+                        "buy_probability": float(buy_probability),
+                        "sell_probability": float(sell_probability),
+                        "per_trade_notional": float(per_trade_notional),
+                        "max_position_notional": float(max_position_notional),
+                        "max_symbols_to_buy_per_run": int(max_symbols_to_buy_per_run),
+                        "stop_loss_pct": float(stop_loss_pct),
+                        "trailing_stop_pct": float(trailing_stop_pct),
+                    },
+                )
+            )
+
+        results.sort(key=lambda item: item.score, reverse=True)
+        write_optimization_csv(self.config["ml"]["optimizer_results_file"], results)
+        return results
+
     def latest_signals(self, end: date | None = None) -> list[MLSignal]:
         artifact = load_model(self.config["ml"]["model_path"])
         end_date = end or date.today()
@@ -289,10 +409,27 @@ class MLStrategy:
         max_buys = int(self.config["strategy"]["max_symbols_to_buy_per_run"])
         buy_probability = float(self.config["ml"]["buy_probability"])
         sell_probability = float(self.config["ml"]["sell_probability"])
+        stop_loss_pct = float(self.config["risk"]["stop_loss_pct"])
 
         decisions: list[Decision] = []
+        risk_sell_symbols: set[str] = set()
+        for position in positions.values():
+            unrealized_plpc = float(getattr(position, "unrealized_plpc", 0.0) or 0.0)
+            if unrealized_plpc <= -(stop_loss_pct / 100):
+                risk_sell_symbols.add(position.symbol)
+                decisions.append(
+                    Decision(
+                        position.symbol,
+                        "sell",
+                        f"live stop loss {unrealized_plpc:.2%} <= -{stop_loss_pct:.2f}%",
+                        qty=float(position.qty),
+                    )
+                )
+
         buys_used = 0
         for signal in self.latest_signals():
+            if signal.symbol in risk_sell_symbols:
+                continue
             position = positions.get(signal.symbol)
             held_qty = float(position.qty) if position else 0.0
             held_value = abs(float(position.market_value)) if position else 0.0
@@ -512,6 +649,68 @@ def index_bars_by_date(bars_by_symbol: dict[str, list[DailyBar]]) -> dict[date, 
     return bars_by_date
 
 
+def update_position_peaks(positions: dict[str, BacktestPosition], bars: dict[str, DailyBar]) -> None:
+    for symbol, position in positions.items():
+        if position.qty <= 0:
+            continue
+        bar = bars.get(symbol)
+        if bar:
+            position.peak_price = max(position.peak_price, bar.close)
+
+
+def risk_exit_signals(
+    positions: dict[str, BacktestPosition],
+    bars: dict[str, DailyBar],
+    stop_loss_pct: float,
+    trailing_stop_pct: float,
+) -> list[dict[str, Any]]:
+    signals: list[dict[str, Any]] = []
+    for symbol, position in positions.items():
+        if position.qty <= 0:
+            continue
+        bar = bars.get(symbol)
+        if not bar:
+            continue
+
+        if position.avg_entry > 0:
+            loss_pct = ((bar.close - position.avg_entry) / position.avg_entry) * 100
+            if loss_pct <= -stop_loss_pct:
+                signals.append(
+                    {
+                        "symbol": symbol,
+                        "action": "sell",
+                        "qty": position.qty,
+                        "reason": f"stop loss {loss_pct:.2f}% <= -{stop_loss_pct:.2f}%",
+                    }
+                )
+                continue
+
+        if position.peak_price > 0:
+            pullback_pct = ((bar.close - position.peak_price) / position.peak_price) * 100
+            if pullback_pct <= -trailing_stop_pct:
+                signals.append(
+                    {
+                        "symbol": symbol,
+                        "action": "sell",
+                        "qty": position.qty,
+                        "reason": f"trailing stop {pullback_pct:.2f}% <= -{trailing_stop_pct:.2f}%",
+                    }
+                )
+    return signals
+
+
+def dedupe_sell_signals(signals: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for signal in signals:
+        symbol = signal["symbol"]
+        if symbol in seen:
+            continue
+        seen.add(symbol)
+        deduped.append(signal)
+    return deduped
+
+
 def load_model(path: str | Path) -> dict[str, Any]:
     model_path = Path(path)
     if not model_path.exists():
@@ -545,4 +744,55 @@ def print_ml_signals(signals: list[MLSignal], buy_probability: float, sell_proba
         print(
             f"{signal.symbol:5} probability={signal.probability:7.2%} "
             f"price=${signal.price:9.2f} asof={signal.timestamp.date()} {label}"
+        )
+
+
+def write_optimization_csv(path: str | Path, results: list[OptimizationResult]) -> None:
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "rank",
+        "score",
+        "total_return_pct",
+        "max_drawdown_pct",
+        "trades",
+        "feasible",
+        "buy_probability",
+        "sell_probability",
+        "per_trade_notional",
+        "max_position_notional",
+        "max_symbols_to_buy_per_run",
+        "stop_loss_pct",
+        "trailing_stop_pct",
+    ]
+    with output.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
+        for rank, result in enumerate(results, start=1):
+            writer.writerow(
+                {
+                    "rank": rank,
+                    "score": round(result.score, 4),
+                    "total_return_pct": round(result.total_return_pct, 4),
+                    "max_drawdown_pct": round(result.max_drawdown_pct, 4),
+                    "trades": result.trades,
+                    "feasible": result.feasible,
+                    **result.params,
+                }
+            )
+
+
+def print_optimization_results(results: list[OptimizationResult], output_path: str, top_n: int = 10) -> None:
+    print(f"Optimization trials: {len(results)}")
+    print(f"Results written to {output_path}")
+    print("\nTop parameter sets")
+    for rank, result in enumerate(results[:top_n], start=1):
+        params = result.params
+        print(
+            f"{rank:2}. score={result.score:7.2f} return={result.total_return_pct:7.2f}% "
+            f"max_dd={result.max_drawdown_pct:7.2f}% trades={result.trades:4} "
+            f"feasible={result.feasible} buy={params['buy_probability']:.2f} "
+            f"sell={params['sell_probability']:.2f} trade=${params['per_trade_notional']:.0f} "
+            f"max_pos=${params['max_position_notional']:.0f} max_buys={params['max_symbols_to_buy_per_run']} "
+            f"stop={params['stop_loss_pct']:.1f}% trail={params['trailing_stop_pct']:.1f}%"
         )

@@ -58,6 +58,14 @@ Backtest the saved model on later dates:
 python main.py ml-backtest --start 2025-01-01 --end 2026-05-01
 ```
 
+Search historical parameter settings with drawdown and trade-count penalties:
+
+```bash
+python main.py optimize-ml-params --start 2025-01-01 --end 2026-05-01
+```
+
+The optimizer tests probability thresholds, position sizing, max buys, stop loss, and trailing stop settings from `config.yml`. It writes ranked results to `logs/ml_parameter_optimization.csv`.
+
 Inspect the latest model probabilities:
 
 ```bash

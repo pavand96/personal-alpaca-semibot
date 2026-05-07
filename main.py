@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 from semibot.backtest import Backtester, print_backtest_result, write_trades_csv
 from semibot.bot import SemiMomentumBot
 from semibot.config import load_config
-from semibot.ml import MLStrategy, print_ml_signals, print_training_result
+from semibot.ml import MLStrategy, print_ml_signals, print_optimization_results, print_training_result
 
 
 def main() -> None:
@@ -24,6 +24,7 @@ def main() -> None:
             "backtest",
             "train-model",
             "ml-backtest",
+            "optimize-ml-params",
             "ml-signal",
             "ml-trade-once",
         ],
@@ -46,7 +47,7 @@ def main() -> None:
 
     config = load_config(args.config)
 
-    if args.command in {"backtest", "train-model", "ml-backtest"}:
+    if args.command in {"backtest", "train-model", "ml-backtest", "optimize-ml-params"}:
         if not args.start:
             raise SystemExit(f"{args.command} requires --start YYYY-MM-DD")
         start = date.fromisoformat(args.start)
@@ -72,6 +73,12 @@ def main() -> None:
         print_backtest_result(result)
         write_trades_csv(config["ml"]["ml_trades_file"], result.trades)
         print(f"\nML trade history written to {config['ml']['ml_trades_file']}")
+        return
+
+    if args.command == "optimize-ml-params":
+        strategy = MLStrategy(config, api_key=api_key, secret_key=secret_key)
+        results = strategy.optimize_parameters(start=start, end=end)
+        print_optimization_results(results, config["ml"]["optimizer_results_file"])
         return
 
     if args.command == "ml-signal":

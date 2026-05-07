@@ -42,6 +42,9 @@ risk:
   dry_run: true
   require_market_open: true
   max_orders_per_run: 3
+  stop_loss_pct: 8.0
+  trailing_stop_pct: 15.0
+  max_account_drawdown_pct: 15.0
 
 runtime:
   interval_seconds: 300
@@ -74,3 +77,14 @@ ml:
   validation_gap_days: 1
   random_state: 42
   ml_trades_file: logs/ml_backtest_trades.csv
+  optimizer_results_file: logs/ml_parameter_optimization.csv
+  optimizer_return_drawdown_penalty: 1.5
+  optimizer_trade_penalty: 0.05
+  optimizer_max_trials: 80
+  buy_probability_grid: [0.50, 0.55, 0.60, 0.65]
+  sell_probability_grid: [0.25, 0.30, 0.35, 0.40]
+  per_trade_notional_grid: [100.0, 250.0]
+  max_position_notional_grid: [500.0, 1000.0, 2000.0]
+  max_symbols_to_buy_per_run_grid: [2, 3]
+  stop_loss_pct_grid: [6.0, 8.0, 10.0]
+  trailing_stop_pct_grid: [12.0, 18.0, 25.0]

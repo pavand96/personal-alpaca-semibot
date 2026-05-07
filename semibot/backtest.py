@@ -29,6 +29,7 @@ class DailyBar:
 class BacktestPosition:
     qty: float = 0.0
     avg_entry: float = 0.0
+    peak_price: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -342,6 +343,7 @@ class Backtester:
             previous_cost = position.avg_entry * position.qty
             position.qty += qty
             position.avg_entry = (previous_cost + notional) / position.qty
+            position.peak_price = max(position.peak_price, price)
             cash_after = cash - notional
         else:
             qty = min(float(signal["qty"]), position.qty)
@@ -353,6 +355,7 @@ class Backtester:
             if position.qty <= 0:
                 position.qty = 0.0
                 position.avg_entry = 0.0
+                position.peak_price = 0.0
             cash_after = cash + notional
 
         return BacktestTrade(
