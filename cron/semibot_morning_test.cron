@@ -1,0 +1,2 @@
+CRON_TZ=America/New_York
+30 8 8 5 * /home/pavand96/personal-alpaca-semibot/scripts/run_ml_morning_test.sh >> /home/pavand96/personal-alpaca-semibot/logs/cron_ml_morning_test.log 2>&1

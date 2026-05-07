@@ -31,8 +31,8 @@ strategy:
   buy_threshold_pct: 2.0
   # Sell an existing position when latest trade is this much below the previous daily close.
   sell_threshold_pct: -1.0
-  per_trade_notional: 100.0
-  max_position_notional: 500.0
+  per_trade_notional: 250.0
+  max_position_notional: 1000.0
   max_symbols_to_buy_per_run: 2
   min_price: 1.0
   max_price: 10000.0
@@ -43,7 +43,7 @@ risk:
   require_market_open: true
   max_orders_per_run: 3
   stop_loss_pct: 8.0
-  trailing_stop_pct: 15.0
+  trailing_stop_pct: 25.0
   max_account_drawdown_pct: 15.0
 
 runtime:
@@ -70,8 +70,8 @@ ml:
   # Label a row positive when the close after this many trading days is above target_return_pct.
   horizon_days: 3
   target_return_pct: 1.0
-  buy_probability: 0.60
-  sell_probability: 0.40
+  buy_probability: 0.50
+  sell_probability: 0.25
   feature_lookback_days: 30
   validation_splits: 5
   validation_gap_days: 1
