@@ -68,6 +68,14 @@ Backtest the saved model on later dates:
 python main.py ml-backtest --start 2025-01-01 --end 2026-05-01
 ```
 
+Estimate Kelly sizing from closed ML backtest trades:
+
+```bash
+python main.py kelly-analysis --start 2025-11-07 --end 2026-05-07
+```
+
+The report prints full, half, and quarter Kelly fractions plus suggested per-trade notionals. Treat full Kelly as aggressive; fractional Kelly is usually more practical for noisy, correlated stock strategies.
+
 Search historical parameter settings with drawdown and trade-count penalties:
 
 ```bash

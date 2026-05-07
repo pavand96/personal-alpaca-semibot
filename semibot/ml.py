@@ -96,6 +96,21 @@ class OptimizationResult:
     params: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class KellyResult:
+    sample_count: int
+    win_rate: float
+    average_win_pct: float
+    average_loss_pct: float
+    payoff_ratio: float
+    full_kelly_fraction: float
+    half_kelly_fraction: float
+    quarter_kelly_fraction: float
+    suggested_full_notional: float
+    suggested_half_notional: float
+    suggested_quarter_notional: float
+
+
 class MLStrategy:
     def __init__(self, config: dict[str, Any], api_key: str, secret_key: str) -> None:
         self.config = config
@@ -384,6 +399,42 @@ class MLStrategy:
         results.sort(key=lambda item: item.score, reverse=True)
         write_optimization_csv(self.config["ml"]["optimizer_results_file"], results)
         return results
+
+    def kelly_analysis(self, start: date, end: date) -> tuple[BacktestResult, KellyResult]:
+        result = self.ml_backtest(start=start, end=end)
+        returns = closed_trade_returns(result.trades)
+        if not returns:
+            raise RuntimeError("No closed ML trades available for Kelly analysis.")
+
+        wins = [value for value in returns if value > 0]
+        losses = [-value for value in returns if value < 0]
+        win_rate = len(wins) / len(returns)
+        average_win = float(np.mean(wins)) if wins else 0.0
+        average_loss = float(np.mean(losses)) if losses else 0.0
+        payoff_ratio = average_win / average_loss if average_loss > 0 else 0.0
+
+        full_kelly = 0.0
+        if payoff_ratio > 0:
+            full_kelly = win_rate - ((1 - win_rate) / payoff_ratio)
+        full_kelly = max(0.0, min(full_kelly, 1.0))
+
+        starting_cash = float(self.config["backtest"]["initial_cash"])
+        return (
+            result,
+            KellyResult(
+                sample_count=len(returns),
+                win_rate=win_rate,
+                average_win_pct=average_win * 100,
+                average_loss_pct=average_loss * 100,
+                payoff_ratio=payoff_ratio,
+                full_kelly_fraction=full_kelly,
+                half_kelly_fraction=full_kelly / 2,
+                quarter_kelly_fraction=full_kelly / 4,
+                suggested_full_notional=starting_cash * full_kelly,
+                suggested_half_notional=starting_cash * full_kelly / 2,
+                suggested_quarter_notional=starting_cash * full_kelly / 4,
+            ),
+        )
 
     def latest_signals(self, end: date | None = None) -> list[MLSignal]:
         artifact = load_model(self.config["ml"]["model_path"])
@@ -711,6 +762,32 @@ def dedupe_sell_signals(signals: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return deduped
 
 
+def closed_trade_returns(trades: list[BacktestTrade]) -> list[float]:
+    lots: dict[str, list[dict[str, float]]] = {}
+    returns: list[float] = []
+
+    for trade in trades:
+        if trade.action == "buy":
+            lots.setdefault(trade.symbol, []).append({"qty": trade.qty, "price": trade.price})
+            continue
+        if trade.action != "sell":
+            continue
+
+        remaining = trade.qty
+        symbol_lots = lots.setdefault(trade.symbol, [])
+        while remaining > 1e-9 and symbol_lots:
+            lot = symbol_lots[0]
+            closed_qty = min(remaining, lot["qty"])
+            if lot["price"] > 0:
+                returns.append((trade.price - lot["price"]) / lot["price"])
+            lot["qty"] -= closed_qty
+            remaining -= closed_qty
+            if lot["qty"] <= 1e-9:
+                symbol_lots.pop(0)
+
+    return returns
+
+
 def load_model(path: str | Path) -> dict[str, Any]:
     model_path = Path(path)
     if not model_path.exists():
@@ -796,3 +873,21 @@ def print_optimization_results(results: list[OptimizationResult], output_path: s
             f"max_pos=${params['max_position_notional']:.0f} max_buys={params['max_symbols_to_buy_per_run']} "
             f"stop={params['stop_loss_pct']:.1f}% trail={params['trailing_stop_pct']:.1f}%"
         )
+
+
+def print_kelly_result(backtest: BacktestResult, kelly: KellyResult) -> None:
+    print("Kelly analysis from ML backtest closed trades")
+    print(f"Backtest return: {backtest.total_return_pct:.2f}%")
+    print(f"Max drawdown: {backtest.max_drawdown_pct:.2f}%")
+    print(f"Closed samples: {kelly.sample_count}")
+    print(f"Win rate: {kelly.win_rate:.2%}")
+    print(f"Average win: {kelly.average_win_pct:.2f}%")
+    print(f"Average loss: {kelly.average_loss_pct:.2f}%")
+    print(f"Payoff ratio: {kelly.payoff_ratio:.2f}")
+    print(f"Full Kelly: {kelly.full_kelly_fraction:.2%}")
+    print(f"Half Kelly: {kelly.half_kelly_fraction:.2%}")
+    print(f"Quarter Kelly: {kelly.quarter_kelly_fraction:.2%}")
+    print("\nSuggested per-trade notional on starting cash")
+    print(f"Full Kelly: ${kelly.suggested_full_notional:,.2f}")
+    print(f"Half Kelly: ${kelly.suggested_half_notional:,.2f}")
+    print(f"Quarter Kelly: ${kelly.suggested_quarter_notional:,.2f}")

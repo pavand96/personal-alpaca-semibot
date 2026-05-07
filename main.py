@@ -15,7 +15,13 @@ from semibot.intraday import (
     print_intraday_result,
     write_intraday_trades_csv,
 )
-from semibot.ml import MLStrategy, print_ml_signals, print_optimization_results, print_training_result
+from semibot.ml import (
+    MLStrategy,
+    print_kelly_result,
+    print_ml_signals,
+    print_optimization_results,
+    print_training_result,
+)
 
 
 def main() -> None:
@@ -30,6 +36,7 @@ def main() -> None:
             "intraday-backtest",
             "train-model",
             "ml-backtest",
+            "kelly-analysis",
             "optimize-ml-params",
             "ml-signal",
             "ml-trade-once",
@@ -53,7 +60,14 @@ def main() -> None:
 
     config = load_config(args.config)
 
-    if args.command in {"backtest", "intraday-backtest", "train-model", "ml-backtest", "optimize-ml-params"}:
+    if args.command in {
+        "backtest",
+        "intraday-backtest",
+        "train-model",
+        "ml-backtest",
+        "kelly-analysis",
+        "optimize-ml-params",
+    }:
         if not args.start:
             raise SystemExit(f"{args.command} requires --start YYYY-MM-DD")
         start = date.fromisoformat(args.start)
@@ -90,6 +104,14 @@ def main() -> None:
         print_backtest_result(result)
         write_trades_csv(config["ml"]["ml_trades_file"], result.trades)
         print(f"\nML trade history written to {config['ml']['ml_trades_file']}")
+        return
+
+    if args.command == "kelly-analysis":
+        result, kelly = MLStrategy(config, api_key=api_key, secret_key=secret_key).kelly_analysis(
+            start=start,
+            end=end,
+        )
+        print_kelly_result(result, kelly)
         return
 
     if args.command == "optimize-ml-params":
