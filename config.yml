@@ -46,11 +46,10 @@ runtime:
 
 backtest:
   initial_cash: 10000.0
-  benchmark_symbols:
-    - SMH
-    - SOXX
-    - QQQ
-    - SPY
+  # Compare against semiconductor stocks directly, not only broad ETFs.
+  benchmark_symbols: []
+  benchmark_include_watchlist: true
+  benchmark_equal_weight_watchlist: true
   # Use split-adjusted bars so splits do not look like real trading gains/losses.
   bar_adjustment: split
   # 5 basis points = 0.05%. This makes simulated fills slightly worse than bar prices.

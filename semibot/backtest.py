@@ -260,13 +260,28 @@ class Backtester:
 
     def run_benchmarks(self, start: date, end: date, starting_cash: float) -> list[BenchmarkResult]:
         settings = self.config["backtest"]
-        symbols = settings.get("benchmark_symbols", [])
-        if not symbols:
+        symbols = list(settings.get("benchmark_symbols", []))
+        if settings.get("benchmark_include_watchlist", True):
+            symbols.extend(self.config["watchlist"])
+        symbols = dedupe_symbols(symbols)
+
+        if not symbols and not settings.get("benchmark_equal_weight_watchlist", True):
             return []
 
         slippage_bps = float(settings["slippage_bps"])
         bars_by_symbol = self.fetch_daily_bars(symbols, start, end)
         results: list[BenchmarkResult] = []
+
+        if settings.get("benchmark_equal_weight_watchlist", True):
+            basket = equal_weight_benchmark(
+                name="SEMIS_EQ",
+                symbols=self.config["watchlist"],
+                bars_by_symbol=bars_by_symbol,
+                starting_cash=starting_cash,
+                slippage_bps=slippage_bps,
+            )
+            if basket:
+                results.append(basket)
 
         for symbol in symbols:
             bars = bars_by_symbol.get(symbol, [])
@@ -428,6 +443,80 @@ def apply_slippage(price: float, action: str, slippage_bps: float) -> float:
     if action == "sell":
         multiplier = 1 - (slippage_bps / 10000)
     return price * multiplier
+
+
+def equal_weight_benchmark(
+    name: str,
+    symbols: list[str],
+    bars_by_symbol: dict[str, list[DailyBar]],
+    starting_cash: float,
+    slippage_bps: float,
+) -> BenchmarkResult | None:
+    available_symbols = [symbol for symbol in symbols if bars_by_symbol.get(symbol)]
+    if not available_symbols:
+        return None
+
+    allocation = starting_cash / len(available_symbols)
+    quantities: dict[str, float] = {}
+    latest_close: dict[str, float] = {}
+    start_dates: list[date] = []
+    end_dates: list[date] = []
+
+    for symbol in available_symbols:
+        bars = bars_by_symbol[symbol]
+        buy_price = apply_slippage(bars[0].open, "buy", slippage_bps)
+        quantities[symbol] = allocation / buy_price
+        latest_close[symbol] = bars[0].close
+        start_dates.append(bars[0].timestamp.date())
+        end_dates.append(bars[-1].timestamp.date())
+
+    indexed = {
+        symbol: {bar.timestamp.date(): bar for bar in bars_by_symbol[symbol]}
+        for symbol in available_symbols
+    }
+    all_dates = sorted({bar_date for bars in indexed.values() for bar_date in bars})
+
+    peak_equity = starting_cash
+    max_drawdown_pct = 0.0
+    ending_equity = starting_cash
+    for bar_date in all_dates:
+        for symbol in available_symbols:
+            bar = indexed[symbol].get(bar_date)
+            if bar:
+                latest_close[symbol] = bar.close
+        ending_equity = sum(quantities[symbol] * latest_close[symbol] for symbol in available_symbols)
+        peak_equity = max(peak_equity, ending_equity)
+        if peak_equity > 0:
+            drawdown_pct = ((ending_equity - peak_equity) / peak_equity) * 100
+            max_drawdown_pct = min(max_drawdown_pct, drawdown_pct)
+
+    for symbol in available_symbols:
+        bars = bars_by_symbol[symbol]
+        latest_close[symbol] = apply_slippage(bars[-1].close, "sell", slippage_bps)
+    ending_equity = sum(quantities[symbol] * latest_close[symbol] for symbol in available_symbols)
+    total_return_pct = ((ending_equity - starting_cash) / starting_cash) * 100
+
+    return BenchmarkResult(
+        symbol=name,
+        start_date=max(start_dates),
+        end_date=min(end_dates),
+        buy_price=0.0,
+        sell_price=0.0,
+        ending_equity=ending_equity,
+        total_return_pct=total_return_pct,
+        max_drawdown_pct=max_drawdown_pct,
+    )
+
+
+def dedupe_symbols(symbols: list[str]) -> list[str]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for symbol in symbols:
+        cleaned = symbol.strip().upper()
+        if cleaned and cleaned not in seen:
+            seen.add(cleaned)
+            deduped.append(cleaned)
+    return deduped
 
 
 def parse_adjustment(value: str) -> Adjustment:

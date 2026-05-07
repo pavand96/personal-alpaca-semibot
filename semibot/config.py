@@ -33,7 +33,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "backtest": {
         "initial_cash": 10000.0,
-        "benchmark_symbols": ["SMH", "SOXX", "QQQ", "SPY"],
+        "benchmark_symbols": [],
+        "benchmark_include_watchlist": True,
+        "benchmark_equal_weight_watchlist": True,
         "bar_adjustment": "split",
         "slippage_bps": 5.0,
         "liquidate_at_end": True,
@@ -65,9 +67,8 @@ def load_config(path: str | Path) -> dict[str, Any]:
         deep_merge(config, user_config)
 
     config["watchlist"] = normalize_symbols(config.get("watchlist", []))
-    config["backtest"]["benchmark_symbols"] = normalize_symbols(
-        config["backtest"].get("benchmark_symbols", [])
-    )
+    benchmark_symbols = config["backtest"].get("benchmark_symbols", [])
+    config["backtest"]["benchmark_symbols"] = normalize_symbols(benchmark_symbols, allow_empty=True)
     return config
 
 
@@ -79,7 +80,7 @@ def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> None:
             base[key] = value
 
 
-def normalize_symbols(symbols: list[Any]) -> list[str]:
+def normalize_symbols(symbols: list[Any], allow_empty: bool = False) -> list[str]:
     seen: set[str] = set()
     normalized: list[str] = []
 
@@ -94,7 +95,7 @@ def normalize_symbols(symbols: list[Any]) -> list[str]:
             seen.add(cleaned)
             normalized.append(cleaned)
 
-    if not normalized:
+    if not normalized and not allow_empty:
         raise ValueError("watchlist must contain at least one symbol")
 
     return normalized
