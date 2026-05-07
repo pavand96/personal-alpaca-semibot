@@ -31,6 +31,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "interval_seconds": 300,
         "log_file": "logs/semibot_events.csv",
     },
+    "backtest": {
+        "initial_cash": 10000.0,
+        "slippage_bps": 5.0,
+        "liquidate_at_end": True,
+        "trades_file": "logs/backtest_trades.csv",
+    },
 }
 
 

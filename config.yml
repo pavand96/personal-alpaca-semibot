@@ -43,3 +43,10 @@ risk:
 runtime:
   interval_seconds: 300
   log_file: logs/semibot_events.csv
+
+backtest:
+  initial_cash: 10000.0
+  # 5 basis points = 0.05%. This makes simulated fills slightly worse than bar prices.
+  slippage_bps: 5.0
+  liquidate_at_end: true
+  trades_file: logs/backtest_trades.csv
