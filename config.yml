@@ -1,0 +1,45 @@
+alpaca:
+  # Keep this true until you have tested the script over many market days.
+  paper: true
+  # IEX is available on free paper accounts. SIP usually requires a paid data plan.
+  data_feed: iex
+
+watchlist:
+  - NVDA
+  - AMD
+  - AVGO
+  - TSM
+  - ASML
+  - ARM
+  - INTC
+  - MU
+  - QCOM
+  - TXN
+  - AMAT
+  - LRCX
+  - KLAC
+  - MRVL
+  - ON
+  - ADI
+  - NXPI
+
+strategy:
+  # Buy when latest trade is this much above the previous daily close.
+  buy_threshold_pct: 2.0
+  # Sell an existing position when latest trade is this much below the previous daily close.
+  sell_threshold_pct: -1.0
+  per_trade_notional: 100.0
+  max_position_notional: 500.0
+  max_symbols_to_buy_per_run: 2
+  min_price: 1.0
+  max_price: 10000.0
+
+risk:
+  # Dry run prints/logs intended orders but does not submit them.
+  dry_run: true
+  require_market_open: true
+  max_orders_per_run: 3
+
+runtime:
+  interval_seconds: 300
+  log_file: logs/semibot_events.csv
