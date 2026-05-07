@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from semibot.bot import MarketView, SemiMomentumBot, account_daily_return_pct
+from semibot.bot import MarketView, SemiMomentumBot, account_daily_return_pct, limit_price_for_side
 
 
 def make_bot() -> SemiMomentumBot:
@@ -60,3 +60,8 @@ def test_account_daily_return_pct_uses_last_equity() -> None:
     account = SimpleNamespace(equity="9700", last_equity="10000")
 
     assert account_daily_return_pct(account) == pytest.approx(-3.0)
+
+
+def test_limit_price_for_side_offsets_buy_and_sell() -> None:
+    assert limit_price_for_side(100.0, "buy", 10.0) == 100.10
+    assert limit_price_for_side(100.0, "sell", 10.0) == 99.90

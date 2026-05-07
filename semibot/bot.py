@@ -10,7 +10,7 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockSnapshotRequest
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, TimeInForce
-from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest
 
 from semibot.events import append_event
 
@@ -192,6 +192,7 @@ class SemiMomentumBot:
 
     def submit_order(self, decision: Decision) -> None:
         side = OrderSide.BUY if decision.action == "buy" else OrderSide.SELL
+        order_type = str(self.config.get("orders", {}).get("type", "market")).lower()
         request_kwargs: dict[str, Any] = {
             "symbol": decision.symbol,
             "side": side,
@@ -199,14 +200,34 @@ class SemiMomentumBot:
             "client_order_id": f"semibot-{decision.symbol}-{uuid4().hex[:12]}",
         }
 
-        if decision.action == "buy":
-            request_kwargs["notional"] = round(decision.notional, 2)
+        if order_type == "limit":
+            reference_price = self.get_latest_price(decision.symbol)
+            offset_bps = float(self.config.get("orders", {}).get("limit_price_offset_bps", 10.0))
+            limit_price = limit_price_for_side(reference_price, decision.action, offset_bps)
+            request_kwargs["limit_price"] = limit_price
+            if decision.action == "buy":
+                request_kwargs["qty"] = round(decision.notional / limit_price, 6)
+            else:
+                request_kwargs["qty"] = decision.qty
+            order = LimitOrderRequest(**request_kwargs)
         else:
-            request_kwargs["qty"] = decision.qty
+            if decision.action == "buy":
+                request_kwargs["notional"] = round(decision.notional, 2)
+            else:
+                request_kwargs["qty"] = decision.qty
+            order = MarketOrderRequest(**request_kwargs)
 
-        order = MarketOrderRequest(**request_kwargs)
         result = self.trading.submit_order(order_data=order)
-        print(f"Submitted {decision.action.upper()} {decision.symbol}: order_id={result.id}")
+        print(f"Submitted {order_type.upper()} {decision.action.upper()} {decision.symbol}: order_id={result.id}")
+
+    def get_latest_price(self, symbol: str) -> float:
+        snapshots = self.data.get_stock_snapshot(
+            StockSnapshotRequest(symbol_or_symbols=[symbol], feed=self.feed)
+        )
+        snapshot = snapshots.get(symbol)
+        if not snapshot or not snapshot.latest_trade:
+            raise RuntimeError(f"No latest trade available for {symbol}")
+        return float(snapshot.latest_trade.price)
 
     def assert_account_can_trade(self) -> None:
         account = self.trading.get_account()
@@ -280,3 +301,12 @@ def account_daily_return_pct(account: Any) -> float:
     if last_equity <= 0:
         return 0.0
     return ((equity / last_equity) - 1) * 100
+
+
+def limit_price_for_side(reference_price: float, action: str, offset_bps: float) -> float:
+    if reference_price <= 0:
+        raise ValueError("reference_price must be positive")
+    multiplier = 1 + (offset_bps / 10000)
+    if action == "sell":
+        multiplier = 1 - (offset_bps / 10000)
+    return round(reference_price * multiplier, 2)

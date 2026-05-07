@@ -60,6 +60,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "take_profit_pct": 1.0,
         "exit_before_close": "15:55",
     },
+    "orders": {
+        "type": "market",
+        "limit_price_offset_bps": 10.0,
+    },
     "live_entry_filter": {
         "enabled": True,
         "min_time": "09:45",
@@ -266,6 +270,11 @@ def validate_config(config: dict[str, Any]) -> None:
     ]:
         require_positive(config["risk"], key)
     validate_hhmm(config["risk"], "exit_before_close")
+
+    order_type = str(config["orders"].get("type", "market")).lower()
+    if order_type not in {"market", "limit"}:
+        raise ValueError("orders.type must be market or limit")
+    require_non_negative(config["orders"], "limit_price_offset_bps")
 
     validate_hhmm(config["live_entry_filter"], "min_time")
     require_non_negative(config["live_entry_filter"], "min_open_gain_pct")

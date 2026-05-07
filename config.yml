@@ -56,6 +56,10 @@ risk:
   take_profit_pct: 1.0
   exit_before_close: "15:55"
 
+orders:
+  type: market
+  limit_price_offset_bps: 10.0
+
 live_entry_filter:
   enabled: true
   min_time: "09:45"
