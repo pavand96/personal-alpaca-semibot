@@ -22,6 +22,9 @@ watchlist:
   - "ON"
   - ADI
   - NXPI
+  - SNDK
+  - GLW
+  - WDC
 
 strategy:
   # Buy when latest trade is this much above the previous daily close.
