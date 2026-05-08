@@ -7,13 +7,15 @@ CRON_TZ=America/New_York
 */15 * * * 1-5 /home/pavand96/personal-alpaca-semibot/.venv/bin/python /home/pavand96/personal-alpaca-semibot/main.py news-monitor >> /home/pavand96/personal-alpaca-semibot/logs/news_monitor.log 2>&1
 
 # ── Pre-market spike stream (WebSocket, ~200ms order latency) ─────────────────
-# Starts at 4:00 AM ET. Streams live trades; orders fire the instant 3+ symbols
-# hit the gap threshold. Stream self-exits when market opens at 9:30 AM.
-# Fallback launches at 7:00 and 9:00 AM in case the 4 AM run was missed/crashed.
-# Lock file in the script prevents duplicate stream processes.
-0   4 * * 1-5 /home/pavand96/personal-alpaca-semibot/scripts/run_spike.sh premarket
-0   7 * * 1-5 /home/pavand96/personal-alpaca-semibot/scripts/run_spike.sh premarket
-0   9 * * 1-5 /home/pavand96/personal-alpaca-semibot/scripts/run_spike.sh premarket
+# Starts at 3:45 AM ET — 15 min before pre-market opens at 4:00 AM.
+# Uses the 15 min to: load earnings calendar, load news signals, fetch
+# reference closes, run startup snapshot, connect both WebSocket streams.
+# By 4:00:00 AM the scanner is fully ready with zero lag on the first trade.
+# Fallback launches at 6:45 AM and 8:45 AM (also 15 min early) if primary crashed.
+# Lock file prevents duplicate processes.
+45  3 * * 1-5 /home/pavand96/personal-alpaca-semibot/scripts/run_spike.sh premarket
+45  6 * * 1-5 /home/pavand96/personal-alpaca-semibot/scripts/run_spike.sh premarket
+45  8 * * 1-5 /home/pavand96/personal-alpaca-semibot/scripts/run_spike.sh premarket
 
 # ── Regular session: adaptive-semis strategy ─────────────────────────────────
 # Runs every 5 min from 9:45 AM to 4:10 PM ET.

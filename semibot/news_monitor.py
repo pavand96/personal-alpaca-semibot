@@ -153,35 +153,46 @@ def scan_news(
 
 
 def run_once(config: dict[str, Any], api_key: str, secret_key: str) -> None:
-    """Main entry point for cron: scan, merge, purge, save, print summary."""
+    """Main entry point for cron: scan news, merge calendar, purge, save, print summary."""
+    from semibot.earnings_calendar import enrich_signals_with_calendar, print_earnings_schedule
+
     settings = config.get("adaptive_semis_allocator", {})
     signals_path = str(settings.get("news_signals_file", "logs/news_signals.json"))
     lookback = int(settings.get("news_monitor_lookback_minutes", 30))
     ttl_hours = int(settings.get("news_signal_ttl_hours", 20))
     bypass_gap = float(settings.get("earnings_bypass_gap_pct", 8.0))
+    lookahead = int(settings.get("earnings_lookahead_days", 7))
 
     now_str = datetime.now(MARKET_TZ).strftime("%Y-%m-%d %H:%M:%S ET")
     print(f"[{now_str}] News monitor scan (lookback={lookback}min, ttl={ttl_hours}h)")
 
+    # 1. News-driven signals
     existing = _load_signals(signals_path)
     new_signals = scan_news(config, api_key, secret_key, lookback_minutes=lookback)
-
-    # Merge: new signals overwrite older ones for the same symbol
     merged = {**existing, **new_signals}
     merged = _purge_stale(merged, ttl_hours)
+
+    # 2. Enrich with earnings calendar (adds/updates earnings_date field)
+    merged = enrich_signals_with_calendar(merged, config["watchlist"], days=lookahead)
 
     _save_signals(signals_path, merged)
 
     if new_signals:
-        print(f"  New signals detected: {len(new_signals)}")
+        print(f"  New news signals: {len(new_signals)}")
         for sym, sig in sorted(new_signals.items(), key=lambda x: -x[1]["score"]):
             bypass_note = f"  [BYPASS ≥{bypass_gap:.0f}%]" if sig["bypass_confirm"] else ""
             print(f"  {sym:6}  score={sig['score']}  type={sig['catalyst_type']:10}{bypass_note}  {sig['headline'][:70]}")
     else:
-        print(f"  No new catalyst signals  (active signals in file: {len(merged)})")
+        print(f"  No new news signals  (active in file: {len(merged)})")
+
+    # 3. Print upcoming earnings schedule
+    print(f"  Earnings calendar (next {lookahead} days):")
+    print_earnings_schedule(config["watchlist"], days=lookahead)
 
     if merged:
-        print(f"  Active signals: {', '.join(sorted(merged))}")
+        today_signals = [s for s, sig in merged.items() if sig.get("earnings_days_away") == 0]
+        if today_signals:
+            print(f"  *** REPORTING TODAY: {', '.join(sorted(today_signals))} — stream will be bidirectional ***")
 
 
 def load_signals_file(path: str) -> dict[str, dict]:

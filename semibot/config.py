@@ -470,6 +470,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "news_signals_file": "logs/news_signals.json",
         "news_monitor_lookback_minutes": 30,
         "news_signal_ttl_hours": 20,
+        "earnings_lookahead_days": 7,
+        "spike_sell_gap_pct": 5.0,
         "trades_file": "logs/adaptive_semis_trades.csv",
     },
 }

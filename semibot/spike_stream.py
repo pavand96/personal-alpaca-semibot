@@ -133,17 +133,41 @@ class SpikeStreamScanner:
         self._dry_run = bool(config["risk"].get("dry_run", True))
         self._offset_bps = float(config.get("orders", {}).get("premarket_limit_offset_bps", 25.0))
 
+        self._sell_gap_threshold = float(self._settings.get("spike_sell_gap_pct", 5.0))
+
         self._reference_closes: dict[str, float] = {}
         self._already_ordered: set[str] = set()
+        self._already_sold: set[str] = set()
         # Qualified but waiting for sector_confirm threshold
         self._pending: dict[str, tuple[float, float]] = {}  # symbol → (gap_pct, price)
         self._order_lock = threading.Lock()
         self._earnings_symbols: set[str] = set()
         # Per-symbol bypass gap threshold — lowered for high-score pre-detected signals
         self._bypass_gap_by_symbol: dict[str, float] = {}
+        # Symbols with earnings TODAY — bidirectional (buy beat, sell miss)
+        self._earnings_today: set[str] = set()
 
     def load_references(self) -> None:
         self._reference_closes = fetch_reference_closes(self.config, self.api_key, self.secret_key)
+
+    def load_earnings_calendar(self) -> None:
+        """Fetch today's earnings reporters — enables sell-on-miss in addition to buy-on-beat."""
+        from semibot.earnings_calendar import get_reporting_today, get_reporting_soon
+
+        lookahead = int(self._settings.get("earnings_lookahead_days", 7))
+        symbols = self.config["watchlist"]
+
+        today_reporters = get_reporting_today(symbols)
+        self._earnings_today = set(today_reporters)
+
+        soon = get_reporting_soon(symbols, days=lookahead)
+        if today_reporters:
+            print(f"  *** EARNINGS TODAY (bidirectional): {', '.join(sorted(today_reporters))} ***")
+            print(f"      Beat → buy immediately | Miss → sell position immediately")
+        elif soon:
+            print(f"  Upcoming earnings: " + "  ".join(f"{s}:{d}" for s, d in sorted(soon.items(), key=lambda x: x[1])))
+        else:
+            print(f"  No earnings in next {lookahead} days")
 
     def load_earnings_symbols(self) -> None:
         """Load catalyst signals: pre-detected signals file first, then fresh 24h news scan.
@@ -261,6 +285,85 @@ class SpikeStreamScanner:
         except Exception as exc:
             log.warning("Could not append spike order event: %s", exc)
 
+    def _place_sell_order(self, symbol: str, gap_pct: float, current_price: float) -> None:
+        """Sell existing position via extended-hours limit order on earnings miss."""
+        from uuid import uuid4
+
+        from alpaca.trading.enums import OrderSide, TimeInForce
+        from alpaca.trading.requests import LimitOrderRequest
+
+        bot = SemiMomentumBot(self.config, api_key=self.api_key, secret_key=self.secret_key)
+        positions = bot.get_positions()
+        position = positions.get(symbol)
+        if not position:
+            log.warning("_place_sell_order: no position found for %s", symbol)
+            return
+        qty = float(getattr(position, "qty", 0.0))
+        if qty <= 0:
+            return
+
+        limit_price = limit_price_for_side(current_price, "sell", self._offset_bps)
+        label = f"earnings miss gap={gap_pct:+.1f}%"
+
+        if self._dry_run:
+            print(f"  DRY-RUN  SELL {symbol}  {qty:.4f}sh @ ${limit_price:.2f}  [{label}]")
+            return
+
+        order = LimitOrderRequest(
+            symbol=symbol,
+            side=OrderSide.SELL,
+            time_in_force=TimeInForce.DAY,
+            qty=qty,
+            limit_price=limit_price,
+            extended_hours=True,
+            client_order_id=f"spike-sell-{symbol}-{uuid4().hex[:10]}",
+        )
+        result = bot.trading.submit_order(order_data=order)
+        print(f"  SELL     {symbol}  {qty:.4f}sh @ ${limit_price:.2f}  [{label}]  id={result.id}")  # type: ignore[union-attr]
+        try:
+            from semibot.spike_tracker import remove_spike_entry
+            remove_spike_entry(self._tracker_path, symbol)
+        except Exception as exc:
+            log.warning("spike_tracker remove failed for %s: %s", symbol, exc)
+        try:
+            append_event(self.config["runtime"]["log_file"], {
+                "event": "earnings_miss_sell",
+                "symbol": symbol,
+                "gap_pct": round(gap_pct, 2),
+                "price": current_price,
+                "limit_price": limit_price,
+                "qty": qty,
+                "order_id": str(result.id),  # type: ignore[union-attr]
+            })
+        except Exception as exc:
+            log.warning("Could not append sell event: %s", exc)
+
+    def _check_earnings_miss(self, symbol: str, gap_pct: float, price: float, source: str) -> bool:
+        """Check if this is an earnings-miss negative gap and sell if we hold the position.
+
+        Returns True if a sell was triggered (caller should skip buy logic).
+        Must NOT be called with _order_lock held.
+        """
+        if gap_pct > -self._sell_gap_threshold:
+            return False
+        if symbol not in self._earnings_today:
+            return False
+        if symbol in self._already_sold:
+            return False
+
+        with self._order_lock:
+            if symbol in self._already_sold:
+                return False
+            held = self._get_held_symbols()
+            if symbol not in held:
+                return False
+            self._already_sold.add(symbol)
+
+        ts = datetime.now(MARKET_TZ).strftime("%H:%M:%S")
+        print(f"[{ts}] *** EARNINGS MISS {symbol} [{source}]: {gap_pct:+.2f}% → SELLING position ***")
+        self._place_sell_order(symbol, gap_pct, price)
+        return True
+
     def _try_queue_or_flush(self, symbol: str, gap_pct: float, price: float, source: str) -> list[tuple[str, float, float]]:
         """Thread-safe: add symbol to pending; return list of (sym, gap, price) to order if threshold met.
 
@@ -313,6 +416,9 @@ class SpikeStreamScanner:
                 if not ref or ref <= 0:
                     continue
                 gap_pct = ((price / ref) - 1) * 100
+                # Check earnings miss (negative gap) before buy logic
+                if self._check_earnings_miss(symbol, gap_pct, price, "STARTUP"):
+                    continue
                 if gap_pct < self._min_gap or gap_pct > self._max_gap:
                     if abs(gap_pct) >= 1.0:
                         print(f"  {symbol}: {gap_pct:+.2f}% (below threshold)")
@@ -355,6 +461,9 @@ class SpikeStreamScanner:
             if not ref or ref <= 0:
                 continue
             gap_pct = ((price / ref) - 1) * 100
+            # Check earnings miss before buy logic
+            if self._check_earnings_miss(symbol, gap_pct, price, "NEWS"):
+                continue
             if gap_pct < self._min_gap or gap_pct > self._max_gap:
                 continue
 
@@ -414,6 +523,13 @@ class SpikeStreamScanner:
 
         price = float(trade.price)
         gap_pct = ((price / ref) - 1) * 100
+
+        # Check earnings miss (negative gap) before buy logic
+        if self._check_earnings_miss(symbol, gap_pct, price, "TRADE"):
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, lambda: None)  # yield to event loop
+            return
+
         if gap_pct < self._min_gap or gap_pct > self._max_gap:
             return
 
@@ -443,12 +559,15 @@ class SpikeStreamScanner:
         symbols = self.config["watchlist"]
         feed = _parse_feed(self.config)
 
-        print("Checking catalyst/earnings calendar...")
+        print("── Earnings calendar ──")
+        self.load_earnings_calendar()
+
+        print("── Catalyst / news signals ──")
         self.load_earnings_symbols()
 
-        print(f"Starting spike scanner  "
-              f"min_gap={self._min_gap:.1f}%  notional=${self._notional:.0f}  "
-              f"sector_confirm={self._sector_confirm}  "
+        print(f"── Starting spike scanner ──  "
+              f"min_gap={self._min_gap:.1f}%  sell_gap=-{self._sell_gap_threshold:.1f}%  "
+              f"notional=${self._notional:.0f}  sector_confirm={self._sector_confirm}  "
               f"earnings_bypass≥{self._earnings_bypass_gap:.0f}%  "
               f"{'DRY-RUN' if self._dry_run else 'LIVE'}")
 

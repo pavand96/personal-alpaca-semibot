@@ -499,6 +499,8 @@ adaptive_semis_allocator:
   news_signals_file: logs/news_signals.json  # written by news-monitor cron, read at stream startup
   news_monitor_lookback_minutes: 30   # how far back each cron run scans for news
   news_signal_ttl_hours: 20           # signals older than this are discarded (clears overnight by next close)
+  earnings_lookahead_days: 7          # how far ahead to check earnings calendar
+  spike_sell_gap_pct: 5.0             # sell existing position if earnings-day gap <= -5%
   score_proportional_sizing: true
   bull_exposure_pct: 0.80
   bull_max_symbols: 5
