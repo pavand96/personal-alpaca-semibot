@@ -437,7 +437,7 @@ sector_balanced_allocator:
   exposure_usage_pct: 0.95
 
 adaptive_semis_allocator:
-  max_total_exposure: 9500.0
+  max_total_exposure: 4500.0
   max_symbols: 3
   rebalance_days: 5
   sector_lookback_days: 20

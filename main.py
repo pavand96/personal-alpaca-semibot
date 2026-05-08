@@ -184,10 +184,10 @@ def main() -> None:
         SemiMomentumBot(config, api_key=api_key, secret_key=secret_key).monitor()
 
     def cmd_trade_once() -> None:
-        SemiMomentumBot(config, api_key=api_key, secret_key=secret_key).trade_once(execute=args.execute)
+        AdaptiveSemiPortfolioBacktester(config, api_key=api_key, secret_key=secret_key).trade_once(execute=args.execute)
 
     def cmd_run() -> None:
-        bot = SemiMomentumBot(config, api_key=api_key, secret_key=secret_key)
+        bot = AdaptiveSemiPortfolioBacktester(config, api_key=api_key, secret_key=secret_key)
         interval = int(config["runtime"]["interval_seconds"])
         while True:
             print(time.strftime("%Y-%m-%d %H:%M:%S"), "running trading check")
