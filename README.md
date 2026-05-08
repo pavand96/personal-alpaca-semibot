@@ -1,6 +1,6 @@
 # Personal Alpaca Semiconductor Bot
 
-This is a small paper-first Alpaca trading script for monitoring semiconductor stocks and optionally placing market orders from a simple momentum rule.
+This is a small paper-first Alpaca trading script for monitoring semiconductor stocks and optionally placing price-controlled limit orders from momentum rules.
 
 It is not a money printer, and it should not be treated as financial advice. The defaults are intentionally conservative: Alpaca paper trading is enabled, `dry_run` is enabled, and live order submission requires both a config change and the `--execute` flag.
 
@@ -52,6 +52,22 @@ python main.py intraday-backtest --start 2025-11-07 --end 2026-05-07
 
 The rule buys at 9:45 AM only when price is at least 1% above the open, above VWAP, relative cumulative volume is above 1.5x the prior 20-day average for the same time window, and the move from open is not already above 4%. It uses a 0.5% stop loss, 1.0% take profit, exits by 3:55 PM, and allows at most one trade per symbol per day.
 
+## Adaptive Semi Portfolio
+
+Backtest a higher-exposure semi rotation strategy:
+
+```bash
+python main.py adaptive-semis-backtest --start 2025-01-01 --end 2026-01-01
+```
+
+This strategy deploys most of the account into the strongest few semiconductor names when sector momentum is positive, rebalances every few days, uses hard/trailing stops, and moves to cash when sector momentum weakens. A broad-market risk filter also blocks new entries when QQQ/SPY momentum and trend are weak or the semi basket is in a deeper drawdown.
+
+The strategy can retain existing winners through normal rebalances when the position has a profit cushion and momentum remains intact. The optional `buzz_earnings_overlay` boosts adaptive candidates with positive recent Alpaca news, blocks candidates with negative news spikes, and avoids new entries around earnings dates from `data/earnings_calendar.csv` unless an existing position already has a configured profit cushion. The earnings CSV should contain `symbol,date` or `symbol,earnings_date` columns.
+
+## Sector Watchlists
+
+`config.yml` includes research watchlists under `sector_watchlists` for energy, software, cybersecurity, quantum, AI infrastructure, cloud/data, and defense/space. These lists are not active trading universes by default; the active bot watchlist remains the top-level semiconductor `watchlist` until a strategy explicitly opts into another sector.
+
 ## Machine Learning
 
 Train a model on historical daily bars:
@@ -66,6 +82,12 @@ Backtest the saved model on later dates:
 
 ```bash
 python main.py ml-backtest --start 2025-01-01 --end 2026-05-01
+```
+
+Backtest walk-forward retraining, currently every 15 days on a rolling 4-year training window:
+
+```bash
+python main.py ml-walk-forward-backtest --start 2025-01-01 --end 2026-01-01
 ```
 
 Estimate Kelly sizing from closed ML backtest trades:
@@ -83,6 +105,7 @@ python main.py optimize-ml-params --start 2025-01-01 --end 2026-05-01
 ```
 
 The optimizer tests probability thresholds, position sizing, max buys, stop loss, and trailing stop settings from `config.yml`. It writes ranked results to `logs/ml_parameter_optimization.csv`.
+When live trading uses percent-of-equity sizing, the optimizer disables that setting during fixed-dollar notional sweeps so the optimized notional grid is meaningful.
 
 Inspect the latest model probabilities:
 
@@ -95,6 +118,8 @@ Run a dry-run ML trading check:
 ```bash
 python main.py ml-trade-once
 ```
+
+Live ML buys are filtered through the stricter intraday quality gate: at least 1% above the open, above VWAP, at least 1.5x relative volume, not already more than 4% above the open, and no existing position in that symbol. The news filter blocks configured negative keywords; for paper testing it defaults to fail-open when the news API is unavailable.
 
 To allow paper orders, keep `alpaca.paper: true`, set `risk.dry_run: false`, and pass `--execute`:
 

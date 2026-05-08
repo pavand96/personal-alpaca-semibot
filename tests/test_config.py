@@ -25,6 +25,41 @@ strategy:
     assert config["risk"]["dry_run"] is True
 
 
+def test_load_config_normalizes_sector_watchlists(tmp_path) -> None:
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        """
+sector_watchlists:
+  Cyber Security:
+    - panw
+    - CRWD
+    - panw
+  quantum:
+    - ionq
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config["sector_watchlists"]["cyber_security"] == ["PANW", "CRWD"]
+    assert config["sector_watchlists"]["quantum"] == ["IONQ"]
+
+
+def test_load_config_uses_strict_paper_trading_defaults(tmp_path) -> None:
+    config = load_config(tmp_path / "missing.yml")
+
+    assert "MSFT" not in config["watchlist"]
+    assert config["orders"]["type"] == "limit"
+    assert config["live_entry_filter"]["min_open_gain_pct"] == 1.0
+    assert config["live_entry_filter"]["relative_volume_min"] == 1.5
+    assert config["news_hold"]["fail_closed"] is False
+    assert config["risk"]["max_total_position_notional"] == 1500.0
+    assert config["ml"]["per_trade_pct_of_equity"] == 0.5
+    assert config["ml"]["max_position_notional"] == 500.0
+    assert config["ml"]["max_symbols_to_buy_per_run"] == 1
+
+
 def test_load_config_rejects_non_string_symbols(tmp_path) -> None:
     config_path = tmp_path / "config.yml"
     config_path.write_text(

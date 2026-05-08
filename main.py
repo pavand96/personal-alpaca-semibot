@@ -7,6 +7,11 @@ from datetime import date
 
 from dotenv import load_dotenv
 
+from semibot.adaptive_allocator import (
+    AdaptiveSemiPortfolioBacktester,
+    print_adaptive_allocator_result,
+    write_adaptive_allocator_trades,
+)
 from semibot.backtest import Backtester, print_backtest_result, write_trades_csv
 from semibot.balanced_allocator import (
     BalancedSectorAllocatorBacktester,
@@ -42,9 +47,11 @@ _DATE_REQUIRED_COMMANDS = frozenset([
     "intraday-backtest",
     "sector-allocator-backtest",
     "sector-balanced-backtest",
+    "adaptive-semis-backtest",
     "sector-swing-backtest",
     "train-model",
     "ml-backtest",
+    "ml-walk-forward-backtest",
     "kelly-analysis",
     "optimize-ml-params",
 ])
@@ -113,6 +120,14 @@ def main() -> None:
         ).run(start=start, end=end)
         print_balanced_allocator_result(result)
 
+    def cmd_adaptive_semis_backtest() -> None:
+        result = AdaptiveSemiPortfolioBacktester(
+            config, api_key=api_key, secret_key=secret_key
+        ).run(start=start, end=end)
+        print_adaptive_allocator_result(result)
+        write_adaptive_allocator_trades(config["adaptive_semis_allocator"]["trades_file"], result.trades)
+        print(f"\nAdaptive semi trade history written to {config['adaptive_semis_allocator']['trades_file']}")
+
     def cmd_sector_swing_backtest() -> None:
         result = SectorSwingAllocatorBacktester(
             config, api_key=api_key, secret_key=secret_key
@@ -131,6 +146,16 @@ def main() -> None:
         print_backtest_result(result)
         write_trades_csv(config["ml"]["ml_trades_file"], result.trades)
         print(f"\nML trade history written to {config['ml']['ml_trades_file']}")
+
+    def cmd_ml_walk_forward_backtest() -> None:
+        result = MLStrategy(config, api_key=api_key, secret_key=secret_key).ml_walk_forward_backtest(
+            start=start,
+            end=end,
+        )
+        print("ML walk-forward backtest")
+        print_backtest_result(result)
+        write_trades_csv(config["ml"]["ml_trades_file"], result.trades)
+        print(f"\nML walk-forward trade history written to {config['ml']['ml_trades_file']}")
 
     def cmd_kelly_analysis() -> None:
         result, kelly = MLStrategy(config, api_key=api_key, secret_key=secret_key).kelly_analysis(
@@ -177,9 +202,11 @@ def main() -> None:
         "intraday-backtest": cmd_intraday_backtest,
         "sector-allocator-backtest": cmd_sector_allocator_backtest,
         "sector-balanced-backtest": cmd_sector_balanced_backtest,
+        "adaptive-semis-backtest": cmd_adaptive_semis_backtest,
         "sector-swing-backtest": cmd_sector_swing_backtest,
         "train-model": cmd_train_model,
         "ml-backtest": cmd_ml_backtest,
+        "ml-walk-forward-backtest": cmd_ml_walk_forward_backtest,
         "kelly-analysis": cmd_kelly_analysis,
         "optimize-ml-params": cmd_optimize_ml_params,
         "ml-signal": cmd_ml_signal,

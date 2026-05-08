@@ -452,6 +452,75 @@ def test_ml_trade_once_quality_filter_failure_produces_hold() -> None:
     assert len(buy_decisions) == 0
 
 
+def test_ml_trade_once_news_keyword_blocks_buy() -> None:
+    strategy = make_strategy()
+    strategy.config["news_hold"] = {
+        "enabled": True,
+        "lookback_hours": 24,
+        "limit_per_symbol": 5,
+        "hold_on_any_recent_news": False,
+        "fail_closed": False,
+        "block_keywords": ["downgrade"],
+    }
+    strategy.news = SimpleNamespace(
+        get_news=lambda request: SimpleNamespace(
+            data=[SimpleNamespace(headline="NVDA downgrade hits shares", summary="", content="")]
+        )
+    )
+    fake_bot = _make_fake_bot()
+    captured: list = []
+
+    def capturing_submit(bot, decisions, dry_run, max_orders):
+        captured.extend(decisions)
+        return [d for d in decisions if d.action != "hold"]
+
+    with (
+        patch("semibot.ml.SemiMomentumBot", return_value=fake_bot),
+        patch.object(strategy, "latest_signals", return_value=[_signal("NVDA")]),
+        patch.object(strategy, "live_entry_quality", return_value={"NVDA": (True, "ok")}),
+        patch("semibot.ml.submit_ml_decisions", side_effect=capturing_submit),
+    ):
+        strategy.ml_trade_once()
+
+    assert [d.action for d in captured] == ["hold"]
+    assert "news keyword" in captured[0].reason
+
+
+def test_ml_trade_once_news_failure_allows_buy_when_fail_open() -> None:
+    strategy = make_strategy()
+    strategy.config["news_hold"] = {
+        "enabled": True,
+        "lookback_hours": 24,
+        "limit_per_symbol": 5,
+        "hold_on_any_recent_news": False,
+        "fail_closed": False,
+        "block_keywords": ["downgrade"],
+    }
+
+    def raise_news_error(request):
+        raise RuntimeError("news unavailable")
+
+    strategy.news = SimpleNamespace(get_news=raise_news_error)
+    fake_bot = _make_fake_bot()
+    captured: list = []
+
+    def capturing_submit(bot, decisions, dry_run, max_orders):
+        captured.extend(decisions)
+        return [d for d in decisions if d.action != "hold"]
+
+    with (
+        patch("semibot.ml.SemiMomentumBot", return_value=fake_bot),
+        patch.object(strategy, "latest_signals", return_value=[_signal("NVDA")]),
+        patch.object(strategy, "live_entry_quality", return_value={"NVDA": (True, "ok")}),
+        patch("semibot.ml.submit_ml_decisions", side_effect=capturing_submit),
+    ):
+        strategy.ml_trade_once()
+
+    buy_decisions = [d for d in captured if d.action == "buy"]
+    assert len(buy_decisions) == 1
+    assert "failed open" in buy_decisions[0].reason
+
+
 def test_ml_trade_once_portfolio_cap_blocks_buy() -> None:
     # total position notional near cap → new buy blocked with hold
     strategy = make_strategy(risk={"max_total_position_notional": 150.0})

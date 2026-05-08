@@ -72,6 +72,8 @@ class BacktestResult:
 class Backtester:
     def __init__(self, config: dict[str, Any], api_key: str, secret_key: str) -> None:
         self.config = config
+        self.api_key = api_key
+        self.secret_key = secret_key
         self.data = StockHistoricalDataClient(api_key=api_key, secret_key=secret_key)
         self.feed = parse_data_feed(config["alpaca"].get("data_feed", "iex"))
         self.adjustment = parse_adjustment(config["backtest"].get("bar_adjustment", "split"))

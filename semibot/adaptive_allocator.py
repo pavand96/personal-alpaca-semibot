@@ -1,0 +1,708 @@
+from __future__ import annotations
+
+import csv
+from dataclasses import dataclass
+from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+from alpaca.data.historical import NewsClient
+from alpaca.data.requests import NewsRequest
+
+from semibot.backtest import (
+    Backtester,
+    BacktestPosition,
+    BacktestResult,
+    BacktestTrade,
+    DailyBar,
+    apply_slippage,
+    market_value,
+    print_backtest_result,
+    write_trades_csv,
+)
+
+
+@dataclass(frozen=True)
+class AdaptiveCandidate:
+    symbol: str
+    score: float
+    fast_return_pct: float
+    slow_return_pct: float
+    volume_ratio: float
+
+
+@dataclass(frozen=True)
+class BuzzSnapshot:
+    article_count: int
+    positive_hits: int
+    negative_hits: int
+    score: float
+
+
+class AdaptiveSemiPortfolioBacktester(Backtester):
+    def run(self, start: date, end: date) -> BacktestResult:
+        settings = self.config["adaptive_semis_allocator"]
+        overlay_settings = self.config.get("buzz_earnings_overlay", {})
+        starting_cash = float(self.config["backtest"]["initial_cash"])
+        cash = starting_cash
+        positions = {symbol: BacktestPosition() for symbol in self.config["watchlist"]}
+        trades: list[BacktestTrade] = []
+        per_symbol_pnl = {symbol: 0.0 for symbol in self.config["watchlist"]}
+
+        max_symbols = int(settings["max_symbols"])
+        max_total_exposure = float(settings["max_total_exposure"])
+        rebalance_days = int(settings["rebalance_days"])
+        fast_lookback = int(settings["fast_momentum_days"])
+        slow_lookback = int(settings["momentum_lookback_days"])
+        sector_lookback = int(settings["sector_lookback_days"])
+        sector_slow_lookback = int(settings["sector_slow_lookback_days"])
+        sector_drawdown_lookback = int(settings["sector_drawdown_lookback_days"])
+        min_sector_return = float(settings["min_sector_return_pct"])
+        min_sector_slow_return = float(settings["min_sector_slow_return_pct"])
+        risk_off_sector_return = float(settings["risk_off_sector_return_pct"])
+        max_sector_drawdown = float(settings["max_sector_drawdown_pct"])
+        risk_filter_symbols = [str(symbol).upper() for symbol in settings.get("risk_filter_symbols", [])]
+        market_momentum_lookback = int(settings["market_momentum_lookback_days"])
+        market_sma_days = int(settings["market_sma_days"])
+        min_market_momentum = float(settings["min_market_momentum_pct"])
+        require_market_above_sma = bool(settings["require_market_above_sma"])
+        min_symbol_return = float(settings["min_symbol_momentum_pct"])
+        min_trade_notional = float(settings["min_trade_notional"])
+        retain_winners = bool(settings["retain_winners"])
+        retain_min_profit_pct = float(settings["retain_min_profit_pct"])
+        retain_min_fast_momentum_pct = float(settings["retain_min_fast_momentum_pct"])
+        retain_min_slow_momentum_pct = float(settings["retain_min_slow_momentum_pct"])
+        trailing_stop_pct = float(settings["trailing_stop_pct"]) / 100
+        hard_stop_pct = float(settings["hard_stop_pct"]) / 100
+        slippage_bps = float(self.config["backtest"]["slippage_bps"])
+
+        max_lookback = max(
+            fast_lookback,
+            slow_lookback,
+            sector_lookback,
+            sector_slow_lookback,
+            sector_drawdown_lookback,
+            market_momentum_lookback,
+            market_sma_days,
+            30,
+        )
+        fetch_start = start - timedelta(days=max_lookback * 3)
+        bars_by_symbol = self.fetch_daily_bars(self.config["watchlist"], fetch_start, end)
+        risk_bars_by_symbol = self.fetch_daily_bars(risk_filter_symbols, fetch_start, end) if risk_filter_symbols else {}
+        news_by_symbol = fetch_news_by_symbol(
+            api_key=self.api_key,
+            secret_key=self.secret_key,
+            symbols=self.config["watchlist"],
+            start=start - timedelta(days=int(overlay_settings.get("news_lookback_days", 7))),
+            end=end,
+            settings=overlay_settings,
+        )
+        earnings_by_symbol = load_earnings_calendar(overlay_settings.get("earnings_calendar_file"))
+        dates = sorted({bar.timestamp.date() for bars in bars_by_symbol.values() for bar in bars})
+        bars_by_date = index_daily_bars_by_date(bars_by_symbol)
+
+        last_rebalance_index = -rebalance_days
+        peak_equity = starting_cash
+        max_drawdown_pct = 0.0
+
+        for day_index, current_date in enumerate(dates):
+            if current_date < start or current_date > end:
+                continue
+            today_bars = bars_by_date[current_date]
+
+            sector_return = sector_return_pct(bars_by_symbol, current_date, sector_lookback)
+            sector_slow_return = sector_return_pct(bars_by_symbol, current_date, sector_slow_lookback)
+            sector_drawdown = sector_drawdown_pct(bars_by_symbol, current_date, sector_drawdown_lookback)
+            market_ok = market_filter_allows_entries(
+                bars_by_symbol=risk_bars_by_symbol,
+                current_date=current_date,
+                momentum_lookback=market_momentum_lookback,
+                sma_days=market_sma_days,
+                min_momentum_pct=min_market_momentum,
+                require_above_sma=require_market_above_sma,
+            )
+            for symbol, position in positions.items():
+                if position.qty <= 0 or symbol not in today_bars:
+                    continue
+                bar = today_bars[symbol]
+                hard_stop_price = position.avg_entry * (1 - hard_stop_pct)
+                trailing_stop_price = position.peak_price * (1 - trailing_stop_pct)
+                stop_price = max(hard_stop_price, trailing_stop_price)
+                if bar.open <= stop_price:
+                    cash = sell_position(
+                        trades=trades,
+                        per_symbol_pnl=per_symbol_pnl,
+                        cash=cash,
+                        position=position,
+                        symbol=symbol,
+                        timestamp=bar.timestamp,
+                        price=apply_slippage(bar.open, "sell", slippage_bps),
+                        reason="gap below adaptive stop",
+                    )
+                    continue
+                if bar.low <= stop_price:
+                    cash = sell_position(
+                        trades=trades,
+                        per_symbol_pnl=per_symbol_pnl,
+                        cash=cash,
+                        position=position,
+                        symbol=symbol,
+                        timestamp=bar.timestamp,
+                        price=apply_slippage(stop_price, "sell", slippage_bps),
+                        reason="adaptive trailing/hard stop",
+                    )
+                    continue
+                position.peak_price = max(position.peak_price, bar.high)
+
+            should_rebalance = day_index - last_rebalance_index >= rebalance_days
+            if should_rebalance:
+                candidates = rank_adaptive_candidates(
+                    bars_by_symbol=bars_by_symbol,
+                    current_date=current_date,
+                    fast_lookback=fast_lookback,
+                    slow_lookback=slow_lookback,
+                    sector_lookback=sector_lookback,
+                    min_sector_return=min_sector_return,
+                    min_symbol_return=min_symbol_return,
+                )
+                candidates = apply_buzz_earnings_overlay(
+                    candidates=candidates,
+                    current_date=current_date,
+                    positions=positions,
+                    today_bars=today_bars,
+                    news_by_symbol=news_by_symbol,
+                    earnings_by_symbol=earnings_by_symbol,
+                    settings=overlay_settings,
+                )
+                risk_off = (
+                    sector_return <= risk_off_sector_return
+                    or sector_slow_return < min_sector_slow_return
+                    or sector_drawdown <= max_sector_drawdown
+                    or not market_ok
+                )
+                target_symbols = set() if risk_off else {candidate.symbol for candidate in candidates[:max_symbols]}
+
+                for symbol, position in positions.items():
+                    if position.qty <= 0 or symbol in target_symbols or symbol not in today_bars:
+                        continue
+                    if (
+                        retain_winners
+                        and not risk_off
+                        and should_retain_winner(
+                            symbol=symbol,
+                            position=position,
+                            current_price=today_bars[symbol].close,
+                            bars_by_symbol=bars_by_symbol,
+                            current_date=current_date,
+                            fast_lookback=fast_lookback,
+                            slow_lookback=slow_lookback,
+                            min_profit_pct=retain_min_profit_pct,
+                            min_fast_momentum_pct=retain_min_fast_momentum_pct,
+                            min_slow_momentum_pct=retain_min_slow_momentum_pct,
+                        )
+                    ):
+                        continue
+                    bar = today_bars[symbol]
+                    cash = sell_position(
+                        trades=trades,
+                        per_symbol_pnl=per_symbol_pnl,
+                        cash=cash,
+                        position=position,
+                        symbol=symbol,
+                        timestamp=bar.timestamp,
+                        price=apply_slippage(bar.open, "sell", slippage_bps),
+                        reason=(
+                            "adaptive risk-off rebalance to cash"
+                            if risk_off
+                            else "adaptive rebalance out"
+                        ),
+                    )
+
+                selected = candidates[:max_symbols] if not risk_off else []
+                if selected:
+                    target_notional = min(max_total_exposure, cash + market_value(positions, today_bars)) / len(selected)
+                    for candidate in selected:
+                        if candidate.symbol not in today_bars:
+                            continue
+                        position = positions[candidate.symbol]
+                        bar = today_bars[candidate.symbol]
+                        price = apply_slippage(bar.open, "buy", slippage_bps)
+                        held_value = position.qty * price
+                        buy_notional = max(0.0, min(target_notional - held_value, cash))
+                        if buy_notional < min_trade_notional:
+                            continue
+                        qty = buy_notional / price
+                        previous_cost = position.avg_entry * position.qty
+                        position.qty += qty
+                        position.avg_entry = (previous_cost + buy_notional) / position.qty
+                        position.peak_price = max(position.peak_price, bar.high, price)
+                        cash -= buy_notional
+                        trades.append(
+                            BacktestTrade(
+                                timestamp=bar.timestamp,
+                                symbol=candidate.symbol,
+                                action="buy",
+                                qty=qty,
+                                price=price,
+                                notional=buy_notional,
+                                cash_after=cash,
+                                reason=(
+                                    f"adaptive score={candidate.score:.2f} "
+                                    f"fast={candidate.fast_return_pct:.2f}% slow={candidate.slow_return_pct:.2f}% "
+                                    f"volume={candidate.volume_ratio:.2f}x sector={sector_return:.2f}% "
+                                    f"sector_slow={sector_slow_return:.2f}% sector_dd={sector_drawdown:.2f}%"
+                                ),
+                            )
+                        )
+                last_rebalance_index = day_index
+
+            equity = cash + market_value(positions, today_bars)
+            peak_equity = max(peak_equity, equity)
+            if peak_equity > 0:
+                drawdown_pct = ((equity - peak_equity) / peak_equity) * 100
+                max_drawdown_pct = min(max_drawdown_pct, drawdown_pct)
+
+        if dates:
+            final_bars = bars_by_date[dates[-1]]
+            for symbol, position in positions.items():
+                if position.qty <= 0 or symbol not in final_bars:
+                    continue
+                bar = final_bars[symbol]
+                cash = sell_position(
+                    trades=trades,
+                    per_symbol_pnl=per_symbol_pnl,
+                    cash=cash,
+                    position=position,
+                    symbol=symbol,
+                    timestamp=bar.timestamp,
+                    price=apply_slippage(bar.close, "sell", slippage_bps),
+                    reason="liquidate at end",
+                )
+
+        ending_equity = cash
+        total_return_pct = ((ending_equity - starting_cash) / starting_cash) * 100
+        benchmarks = self.run_benchmarks(start=start, end=end, starting_cash=starting_cash)
+        return BacktestResult(
+            start=start,
+            end=end,
+            starting_cash=starting_cash,
+            ending_equity=ending_equity,
+            total_return_pct=total_return_pct,
+            max_drawdown_pct=max_drawdown_pct,
+            trades=trades,
+            per_symbol_pnl=per_symbol_pnl,
+            benchmarks=benchmarks,
+        )
+
+
+def rank_adaptive_candidates(
+    bars_by_symbol: dict[str, list[DailyBar]],
+    current_date: date,
+    fast_lookback: int,
+    slow_lookback: int,
+    sector_lookback: int,
+    min_sector_return: float,
+    min_symbol_return: float,
+) -> list[AdaptiveCandidate]:
+    sector_return = sector_return_pct(bars_by_symbol, current_date, sector_lookback)
+    if sector_return < min_sector_return:
+        return []
+
+    candidates: list[AdaptiveCandidate] = []
+    for symbol, bars in bars_by_symbol.items():
+        prior = [bar for bar in bars if bar.timestamp.date() < current_date]
+        if len(prior) <= max(fast_lookback, slow_lookback, 20):
+            continue
+        latest = prior[-1]
+        fast_base = prior[-fast_lookback - 1]
+        slow_base = prior[-slow_lookback - 1]
+        if fast_base.close <= 0 or slow_base.close <= 0:
+            continue
+        fast_return = ((latest.close / fast_base.close) - 1) * 100
+        slow_return = ((latest.close / slow_base.close) - 1) * 100
+        if fast_return < min_symbol_return or slow_return < min_symbol_return:
+            continue
+        avg_volume = sum(bar.volume for bar in prior[-20:]) / 20
+        volume_ratio = latest.volume / avg_volume if avg_volume > 0 else 1.0
+        score = slow_return * 0.9 + fast_return * 1.8 + min(volume_ratio, 3.0) * 2.0 + sector_return * 0.5
+        candidates.append(
+            AdaptiveCandidate(
+                symbol=symbol,
+                score=score,
+                fast_return_pct=fast_return,
+                slow_return_pct=slow_return,
+                volume_ratio=volume_ratio,
+            )
+        )
+    return sorted(candidates, key=lambda item: item.score, reverse=True)
+
+
+def sector_return_pct(
+    bars_by_symbol: dict[str, list[DailyBar]],
+    current_date: date,
+    lookback_days: int,
+) -> float:
+    returns: list[float] = []
+    for bars in bars_by_symbol.values():
+        prior = [bar for bar in bars if bar.timestamp.date() < current_date]
+        if len(prior) <= lookback_days:
+            continue
+        latest = prior[-1]
+        base = prior[-lookback_days - 1]
+        if base.close > 0:
+            returns.append(((latest.close / base.close) - 1) * 100)
+    return sum(returns) / len(returns) if returns else 0.0
+
+
+def should_retain_winner(
+    symbol: str,
+    position: BacktestPosition,
+    current_price: float,
+    bars_by_symbol: dict[str, list[DailyBar]],
+    current_date: date,
+    fast_lookback: int,
+    slow_lookback: int,
+    min_profit_pct: float,
+    min_fast_momentum_pct: float,
+    min_slow_momentum_pct: float,
+) -> bool:
+    if position.qty <= 0 or position.avg_entry <= 0:
+        return False
+    profit_pct = ((current_price / position.avg_entry) - 1) * 100
+    if profit_pct < min_profit_pct:
+        return False
+
+    prior = [bar for bar in bars_by_symbol.get(symbol, []) if bar.timestamp.date() < current_date]
+    if len(prior) <= max(fast_lookback, slow_lookback):
+        return False
+    latest = prior[-1]
+    fast_base = prior[-fast_lookback - 1]
+    slow_base = prior[-slow_lookback - 1]
+    if fast_base.close <= 0 or slow_base.close <= 0:
+        return False
+    fast_return = ((latest.close / fast_base.close) - 1) * 100
+    slow_return = ((latest.close / slow_base.close) - 1) * 100
+    return fast_return >= min_fast_momentum_pct and slow_return >= min_slow_momentum_pct
+
+
+def apply_buzz_earnings_overlay(
+    candidates: list[AdaptiveCandidate],
+    current_date: date,
+    positions: dict[str, BacktestPosition],
+    today_bars: dict[str, DailyBar],
+    news_by_symbol: dict[str, list[tuple[date, str]]],
+    earnings_by_symbol: dict[str, set[date]],
+    settings: dict[str, Any],
+) -> list[AdaptiveCandidate]:
+    if not bool(settings.get("enabled", False)):
+        return candidates
+
+    adjusted: list[AdaptiveCandidate] = []
+    for candidate in candidates:
+        bar = today_bars.get(candidate.symbol)
+        if not bar:
+            continue
+        if is_earnings_blocked(
+            symbol=candidate.symbol,
+            current_date=current_date,
+            position=positions[candidate.symbol],
+            current_price=bar.close,
+            earnings_by_symbol=earnings_by_symbol,
+            settings=settings,
+        ):
+            continue
+
+        buzz = buzz_snapshot(
+            symbol=candidate.symbol,
+            current_date=current_date,
+            news_by_symbol=news_by_symbol,
+            settings=settings,
+        )
+        if buzz.score <= float(settings.get("negative_score_block_threshold", -3.0)):
+            continue
+        score_boost = max(
+            -float(settings.get("max_score_boost", 20.0)),
+            min(
+                float(settings.get("max_score_boost", 20.0)),
+                buzz.score * float(settings.get("score_weight", 2.0)),
+            ),
+        )
+        adjusted.append(
+            AdaptiveCandidate(
+                symbol=candidate.symbol,
+                score=candidate.score + score_boost,
+                fast_return_pct=candidate.fast_return_pct,
+                slow_return_pct=candidate.slow_return_pct,
+                volume_ratio=candidate.volume_ratio,
+            )
+        )
+
+    return sorted(adjusted, key=lambda item: item.score, reverse=True)
+
+
+def buzz_snapshot(
+    symbol: str,
+    current_date: date,
+    news_by_symbol: dict[str, list[tuple[date, str]]],
+    settings: dict[str, Any],
+) -> BuzzSnapshot:
+    lookback_days = int(settings.get("news_lookback_days", 7))
+    positive_keywords = [str(item).lower() for item in settings.get("positive_keywords", [])]
+    negative_keywords = [str(item).lower() for item in settings.get("negative_keywords", [])]
+    start_date = current_date - timedelta(days=lookback_days)
+
+    article_count = 0
+    positive_hits = 0
+    negative_hits = 0
+    for news_date, text in news_by_symbol.get(symbol, []):
+        if not start_date <= news_date < current_date:
+            continue
+        article_count += 1
+        positive_hits += sum(1 for keyword in positive_keywords if keyword and keyword in text)
+        negative_hits += sum(1 for keyword in negative_keywords if keyword and keyword in text)
+
+    score = (
+        min(article_count, int(settings.get("article_count_cap", 5))) * float(settings.get("article_weight", 0.4))
+        + positive_hits * float(settings.get("positive_keyword_weight", 1.0))
+        - negative_hits * float(settings.get("negative_keyword_weight", 2.0))
+    )
+    return BuzzSnapshot(
+        article_count=article_count,
+        positive_hits=positive_hits,
+        negative_hits=negative_hits,
+        score=score,
+    )
+
+
+def is_earnings_blocked(
+    symbol: str,
+    current_date: date,
+    position: BacktestPosition,
+    current_price: float,
+    earnings_by_symbol: dict[str, set[date]],
+    settings: dict[str, Any],
+) -> bool:
+    if not bool(settings.get("block_new_entries_near_earnings", True)):
+        return False
+
+    before_days = int(settings.get("earnings_avoid_days_before", 2))
+    after_days = int(settings.get("earnings_avoid_days_after", 1))
+    nearby = [
+        earnings_date
+        for earnings_date in earnings_by_symbol.get(symbol, set())
+        if -after_days <= (earnings_date - current_date).days <= before_days
+    ]
+    if not nearby:
+        return False
+    if position.qty <= 0 or position.avg_entry <= 0:
+        return True
+    profit_cushion = ((current_price / position.avg_entry) - 1) * 100
+    return profit_cushion < float(settings.get("allow_earnings_if_profit_cushion_pct", 5.0))
+
+
+def fetch_news_by_symbol(
+    api_key: str,
+    secret_key: str,
+    symbols: list[str],
+    start: date,
+    end: date,
+    settings: dict[str, Any],
+) -> dict[str, list[tuple[date, str]]]:
+    if not bool(settings.get("enabled", False)) or not bool(settings.get("news_enabled", True)):
+        return {}
+
+    result: dict[str, list[tuple[date, str]]] = {symbol: [] for symbol in symbols}
+    client = NewsClient(api_key=api_key, secret_key=secret_key)
+    chunk_days = int(settings.get("news_fetch_chunk_days", 30))
+    limit = int(settings.get("news_limit_per_request", 50))
+    try:
+        for symbol in symbols:
+            chunk_start = start
+            while chunk_start <= end:
+                chunk_end = min(end, chunk_start + timedelta(days=chunk_days))
+                request = NewsRequest(
+                    symbols=symbol,
+                    start=datetime.combine(chunk_start, datetime.min.time(), tzinfo=UTC),
+                    end=datetime.combine(chunk_end, datetime.max.time(), tzinfo=UTC),
+                    limit=limit,
+                    include_content=True,
+                )
+                response = client.get_news(request)
+                for article in extract_news_articles(response):
+                    article_date = news_article_date(article)
+                    if article_date is None:
+                        continue
+                    result.setdefault(symbol, []).append((article_date, news_article_text(article)))
+                chunk_start = chunk_end + timedelta(days=1)
+    except Exception as error:
+        if bool(settings.get("fail_open", True)):
+            print(f"Buzz/news overlay unavailable; continuing without news scores ({type(error).__name__})")
+            return {}
+        raise
+
+    return result
+
+
+def extract_news_articles(response: Any) -> list[Any]:
+    raw_articles = getattr(response, "data", getattr(response, "news", response))
+    if isinstance(raw_articles, dict):
+        articles: list[Any] = []
+        for value in raw_articles.values():
+            if isinstance(value, list):
+                articles.extend(value)
+            else:
+                articles.append(value)
+        return articles
+    if raw_articles is None:
+        return []
+    try:
+        return list(raw_articles)
+    except TypeError:
+        return [raw_articles]
+
+
+def news_article_date(article: Any) -> date | None:
+    value = getattr(article, "created_at", None)
+    if isinstance(article, dict):
+        value = article.get("created_at", value)
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).date()
+        except ValueError:
+            return None
+    return None
+
+
+def news_article_text(article: Any) -> str:
+    fields = [
+        getattr(article, "headline", ""),
+        getattr(article, "summary", ""),
+        getattr(article, "content", ""),
+    ]
+    if isinstance(article, dict):
+        fields.extend([article.get("headline", ""), article.get("summary", ""), article.get("content", "")])
+    return " ".join(str(value).lower() for value in fields if value)
+
+
+def load_earnings_calendar(path_value: Any) -> dict[str, set[date]]:
+    if not path_value:
+        return {}
+    path = Path(str(path_value))
+    if not path.exists():
+        return {}
+
+    result: dict[str, set[date]] = {}
+    with path.open("r", encoding="utf-8", newline="") as file:
+        reader = csv.DictReader(file)
+        for row in reader:
+            symbol = str(row.get("symbol", "")).strip().upper()
+            raw_date = row.get("date") or row.get("earnings_date")
+            if not symbol or not raw_date:
+                continue
+            try:
+                earnings_date = date.fromisoformat(str(raw_date).strip())
+            except ValueError:
+                continue
+            result.setdefault(symbol, set()).add(earnings_date)
+    return result
+
+
+def sector_drawdown_pct(
+    bars_by_symbol: dict[str, list[DailyBar]],
+    current_date: date,
+    lookback_days: int,
+) -> float:
+    drawdowns: list[float] = []
+    for bars in bars_by_symbol.values():
+        prior = [bar for bar in bars if bar.timestamp.date() < current_date]
+        if len(prior) < lookback_days:
+            continue
+        window = prior[-lookback_days:]
+        peak = max(bar.close for bar in window)
+        latest = window[-1].close
+        if peak > 0:
+            drawdowns.append(((latest - peak) / peak) * 100)
+    return sum(drawdowns) / len(drawdowns) if drawdowns else 0.0
+
+
+def market_filter_allows_entries(
+    bars_by_symbol: dict[str, list[DailyBar]],
+    current_date: date,
+    momentum_lookback: int,
+    sma_days: int,
+    min_momentum_pct: float,
+    require_above_sma: bool,
+) -> bool:
+    if not bars_by_symbol:
+        return True
+
+    usable_symbols = 0
+    for bars in bars_by_symbol.values():
+        prior = [bar for bar in bars if bar.timestamp.date() < current_date]
+        if len(prior) <= max(momentum_lookback, sma_days):
+            continue
+        usable_symbols += 1
+        latest = prior[-1]
+        momentum_base = prior[-momentum_lookback - 1]
+        if momentum_base.close <= 0:
+            return False
+        momentum_pct = ((latest.close / momentum_base.close) - 1) * 100
+        if momentum_pct < min_momentum_pct:
+            return False
+        if require_above_sma:
+            sma = sum(bar.close for bar in prior[-sma_days:]) / sma_days
+            if latest.close < sma:
+                return False
+
+    return usable_symbols > 0
+
+
+def index_daily_bars_by_date(bars_by_symbol: dict[str, list[DailyBar]]) -> dict[date, dict[str, DailyBar]]:
+    bars_by_date: dict[date, dict[str, DailyBar]] = {}
+    for symbol, bars in bars_by_symbol.items():
+        for bar in bars:
+            bars_by_date.setdefault(bar.timestamp.date(), {})[symbol] = bar
+    return bars_by_date
+
+
+def sell_position(
+    trades: list[BacktestTrade],
+    per_symbol_pnl: dict[str, float],
+    cash: float,
+    position: BacktestPosition,
+    symbol: str,
+    timestamp: datetime,
+    price: float,
+    reason: str,
+) -> float:
+    qty = position.qty
+    notional = qty * price
+    per_symbol_pnl[symbol] = per_symbol_pnl.get(symbol, 0.0) + (price - position.avg_entry) * qty
+    cash_after = cash + notional
+    trades.append(
+        BacktestTrade(
+            timestamp=timestamp,
+            symbol=symbol,
+            action="sell",
+            qty=qty,
+            price=price,
+            notional=notional,
+            cash_after=cash_after,
+            reason=reason,
+        )
+    )
+    position.qty = 0.0
+    position.avg_entry = 0.0
+    position.peak_price = 0.0
+    return cash_after
+
+
+def print_adaptive_allocator_result(result: BacktestResult) -> None:
+    print("Adaptive semi portfolio")
+    print_backtest_result(result)
+
+
+def write_adaptive_allocator_trades(path: str, trades: list[BacktestTrade]) -> None:
+    write_trades_csv(path, trades)

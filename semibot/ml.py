@@ -12,7 +12,7 @@ import joblib
 import numpy as np
 import pandas as pd
 from alpaca.data.historical import NewsClient
-from alpaca.data.requests import StockBarsRequest
+from alpaca.data.requests import NewsRequest, StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from sklearn.base import clone
 from sklearn.compose import ColumnTransformer
@@ -356,6 +356,212 @@ class MLStrategy:
             benchmarks=benchmarks,
         )
 
+    def ml_walk_forward_backtest(self, start: date, end: date) -> BacktestResult:
+        settings = self.config["backtest"]
+        ml_settings = self.config["ml"]
+        starting_cash = float(settings["initial_cash"])
+        cash = starting_cash
+        positions = {symbol: BacktestPosition() for symbol in self.config["watchlist"]}
+        trades: list[BacktestTrade] = []
+        per_symbol_pnl = {symbol: 0.0 for symbol in self.config["watchlist"]}
+
+        retrain_days = int(ml_settings.get("walk_forward_retrain_days", 15))
+        training_lookback_days = int(ml_settings.get("walk_forward_training_lookback_days", 1460))
+        fetch_start = start - timedelta(days=training_lookback_days + int(ml_settings["feature_lookback_days"]) * 3)
+        bars_by_symbol = self.backtester.fetch_daily_bars(self.config["watchlist"], fetch_start, end)
+        dates = sorted({bar.timestamp.date() for bars in bars_by_symbol.values() for bar in bars})
+        bars_by_date = index_bars_by_date(bars_by_symbol)
+        frame = build_feature_frame(
+            bars_by_symbol=bars_by_symbol,
+            horizon_days=int(ml_settings["horizon_days"]),
+            target_return_pct=float(ml_settings["target_return_pct"]),
+        ).sort_values(["date", "symbol"]).reset_index(drop=True)
+
+        max_orders = int(self.config["risk"]["max_orders_per_run"])
+        max_buys = int(ml_settings.get("max_symbols_to_buy_per_run", self.config["strategy"]["max_symbols_to_buy_per_run"]))
+        per_trade_pct_of_equity = ml_settings.get("per_trade_pct_of_equity")
+        per_trade_notional = float(ml_settings.get("per_trade_notional", self.config["strategy"]["per_trade_notional"]))
+        max_position_notional = float(ml_settings.get("max_position_notional", self.config["strategy"]["max_position_notional"]))
+        min_price = float(self.config["strategy"]["min_price"])
+        max_price = float(self.config["strategy"]["max_price"])
+        buy_probability = float(ml_settings["buy_probability"])
+        sell_probability = float(ml_settings["sell_probability"])
+        slippage_bps = float(settings["slippage_bps"])
+        stop_loss_pct = float(ml_settings.get("stop_loss_pct", self.config["risk"]["stop_loss_pct"]))
+        trailing_stop_pct = float(ml_settings.get("trailing_stop_pct", self.config["risk"]["trailing_stop_pct"]))
+        max_account_drawdown_pct = float(self.config["risk"]["max_account_drawdown_pct"])
+
+        artifact: dict[str, Any] | None = None
+        next_retrain_date = start
+        peak_equity = starting_cash
+        kill_switch_peak = starting_cash
+        max_drawdown_pct = 0.0
+        pending_signals: list[dict[str, Any]] = []
+
+        for current_date in dates:
+            if current_date < start:
+                continue
+
+            today_bars = bars_by_date.get(current_date, {})
+            if pending_signals:
+                orders_used = 0
+                for signal in pending_signals:
+                    if orders_used >= max_orders:
+                        break
+                    bar = today_bars.get(signal["symbol"])
+                    if not bar:
+                        continue
+                    trade = self.backtester.execute_signal(
+                        signal=signal,
+                        bar=bar,
+                        cash=cash,
+                        positions=positions,
+                        per_symbol_pnl=per_symbol_pnl,
+                        slippage_bps=slippage_bps,
+                    )
+                    if trade:
+                        cash = trade.cash_after
+                        trades.append(trade)
+                        orders_used += 1
+                pending_signals = []
+
+            if artifact is None or current_date >= next_retrain_date:
+                train_start = current_date - timedelta(days=training_lookback_days)
+                train = frame[(frame["date"] >= train_start) & (frame["target_date"] < current_date)]
+                if not train.empty and train["target"].nunique() >= 2:
+                    estimator = build_estimator(
+                        model_type=ml_settings["model_type"],
+                        random_state=int(ml_settings["random_state"]),
+                    )
+                    estimator.fit(train[MODEL_FEATURES], train["target"])
+                    artifact = {
+                        "estimator": estimator,
+                        "feature_columns": MODEL_FEATURES,
+                        "numeric_features": NUMERIC_FEATURES,
+                        "categorical_features": CATEGORICAL_FEATURES,
+                    }
+                next_retrain_date = current_date + timedelta(days=retrain_days)
+
+            equity = cash + market_value(positions, today_bars)
+            if per_trade_pct_of_equity is not None:
+                per_trade_notional = max(1.0, round(equity * float(per_trade_pct_of_equity) / 100, 2))
+            peak_equity = max(peak_equity, equity)
+            if peak_equity > 0:
+                drawdown_pct = ((equity - peak_equity) / peak_equity) * 100
+                max_drawdown_pct = min(max_drawdown_pct, drawdown_pct)
+            any_held = any(pos.qty > 0 for pos in positions.values())
+            kill_switch_peak = max(kill_switch_peak, equity) if any_held else equity
+            account_drawdown_pct = abs(min(0.0, ((equity - kill_switch_peak) / kill_switch_peak) * 100)) if kill_switch_peak else 0.0
+
+            update_position_peaks(positions, today_bars)
+            risk_signals = risk_exit_signals(
+                positions=positions,
+                bars=today_bars,
+                stop_loss_pct=stop_loss_pct,
+                trailing_stop_pct=trailing_stop_pct,
+            )
+            if account_drawdown_pct >= max_account_drawdown_pct:
+                risk_signals.extend(
+                    {
+                        "symbol": symbol,
+                        "action": "sell",
+                        "qty": position.qty,
+                        "reason": f"account drawdown {account_drawdown_pct:.2f}% >= limit {max_account_drawdown_pct:.2f}%",
+                    }
+                    for symbol, position in positions.items()
+                    if position.qty > 0
+                )
+                pending_signals = dedupe_sell_signals(risk_signals)
+                continue
+            if artifact is None:
+                pending_signals = risk_signals
+                continue
+
+            feature_rows = feature_rows_for_date(bars_by_symbol, current_date)
+            if not feature_rows:
+                pending_signals = risk_signals
+                continue
+            predictions = predict_rows(artifact, pd.DataFrame(feature_rows))
+
+            signals: list[dict[str, Any]] = list(risk_signals)
+            risk_sell_symbols = {signal["symbol"] for signal in risk_signals}
+            buys_used = 0
+            for pred in sorted(predictions, key=lambda item: item.probability, reverse=True):
+                if pred.symbol in risk_sell_symbols:
+                    continue
+                position = positions[pred.symbol]
+                held_value = position.qty * pred.price
+                if pred.price < min_price or pred.price > max_price:
+                    continue
+                if position.qty > 0 and pred.probability <= sell_probability:
+                    signals.append({"symbol": pred.symbol, "action": "sell", "qty": position.qty, "reason": pred.reason})
+                    continue
+                if (
+                    pred.probability >= buy_probability
+                    and held_value + per_trade_notional <= max_position_notional
+                    and buys_used < max_buys
+                ):
+                    adjusted_notional = correlation_adjusted_notional(
+                        symbol=pred.symbol,
+                        base_notional=per_trade_notional,
+                        held_symbols=[
+                            symbol
+                            for symbol, held_position in positions.items()
+                            if held_position.qty > 0 and symbol != pred.symbol
+                        ],
+                        bars_by_symbol=bars_by_symbol,
+                        as_of_date=current_date,
+                        settings=self.config["portfolio"],
+                    )
+                    if adjusted_notional <= 0:
+                        continue
+                    buys_used += 1
+                    signals.append(
+                        {
+                            "symbol": pred.symbol,
+                            "action": "buy",
+                            "notional": adjusted_notional,
+                            "reason": (
+                                f"{pred.reason}; walk-forward retrain {retrain_days}d; "
+                                f"correlation-adjusted notional ${adjusted_notional:.2f}"
+                            ),
+                        }
+                    )
+            pending_signals = signals
+
+        if settings.get("liquidate_at_end", True) and dates:
+            final_bars = bars_by_date.get(dates[-1], {})
+            for symbol, position in positions.items():
+                if position.qty <= 0 or symbol not in final_bars:
+                    continue
+                trade = self.backtester.execute_signal(
+                    signal={"symbol": symbol, "action": "sell", "qty": position.qty, "reason": "final liquidation"},
+                    bar=final_bars[symbol],
+                    cash=cash,
+                    positions=positions,
+                    per_symbol_pnl=per_symbol_pnl,
+                    slippage_bps=slippage_bps,
+                    use_close=True,
+                )
+                if trade:
+                    cash = trade.cash_after
+                    trades.append(trade)
+
+        ending_equity = cash
+        total_return_pct = ((ending_equity - starting_cash) / starting_cash) * 100
+        benchmarks = self.backtester.run_benchmarks(start=start, end=end, starting_cash=starting_cash)
+        return BacktestResult(
+            start=start,
+            end=end,
+            starting_cash=starting_cash,
+            ending_equity=ending_equity,
+            total_return_pct=total_return_pct,
+            max_drawdown_pct=max_drawdown_pct,
+            trades=trades,
+            per_symbol_pnl=per_symbol_pnl,
+            benchmarks=benchmarks,
+        )
+
     def optimize_parameters(self, start: date, end: date) -> list[OptimizationResult]:
         ml_settings = self.config["ml"]
         max_trials = int(ml_settings["optimizer_max_trials"])
@@ -391,6 +597,10 @@ class MLStrategy:
                 continue
 
             trial_config = deepcopy(self.config)
+            # The optimizer grid sweeps fixed-dollar sizing. Live trading may use
+            # percent-of-equity sizing, so remove it here to avoid optimizing the
+            # wrong parameter by accident.
+            trial_config["ml"].pop("per_trade_pct_of_equity", None)
             trial_config["ml"]["buy_probability"] = float(buy_probability)
             trial_config["ml"]["sell_probability"] = float(sell_probability)
             trial_config["ml"]["per_trade_notional"] = float(per_trade_notional)
@@ -593,9 +803,13 @@ class MLStrategy:
                 signal.symbol,
                 (False, "blocked by live entry quality filter"),
             )
+            news_passed, news_reason = (True, "news filter skipped")
+            if signal.probability >= buy_probability and quality_passed and held_qty <= 0:
+                news_passed, news_reason = self.news_hold_check(signal.symbol)
             if (
                 signal.probability >= buy_probability
                 and quality_passed
+                and news_passed
                 and held_qty <= 0
                 and held_value + per_trade_notional <= max_position_notional
                 and total_position_notional + queued_buy_notional + per_trade_notional <= max_total_position_notional
@@ -604,12 +818,19 @@ class MLStrategy:
                 buys_used += 1
                 queued_buy_notional += per_trade_notional
                 decisions.append(
-                    Decision(signal.symbol, "buy", f"{signal.reason}; {quality_reason}", notional=per_trade_notional)
+                    Decision(
+                        signal.symbol,
+                        "buy",
+                        f"{signal.reason}; {quality_reason}; {news_reason}",
+                        notional=per_trade_notional,
+                    )
                 )
             elif signal.probability >= buy_probability and held_qty <= 0 and not quality_passed:
                 decisions.append(
                     Decision(signal.symbol, "hold", quality_reason)
                 )
+            elif signal.probability >= buy_probability and held_qty <= 0 and not news_passed:
+                decisions.append(Decision(signal.symbol, "hold", news_reason))
             elif (
                 signal.probability >= buy_probability
                 and total_position_notional + queued_buy_notional + per_trade_notional > max_total_position_notional
@@ -758,6 +979,41 @@ class MLStrategy:
 
         return result
 
+    def news_hold_check(self, symbol: str) -> tuple[bool, str]:
+        settings = self.config.get("news_hold")
+        if not settings or not bool(settings.get("enabled", True)):
+            return True, "news filter disabled"
+
+        now = datetime.now(UTC)
+        request = NewsRequest(
+            symbols=symbol,
+            start=now - timedelta(hours=int(settings.get("lookback_hours", 24))),
+            end=now,
+            limit=int(settings.get("limit_per_symbol", 5)),
+            include_content=True,
+        )
+        try:
+            response = self.news.get_news(request)
+        except Exception as error:
+            if bool(settings.get("fail_closed", False)):
+                return False, f"blocked: news lookup failed ({type(error).__name__})"
+            return True, f"news lookup failed open ({type(error).__name__})"
+
+        articles = extract_news_articles(response)
+        if not articles:
+            return True, "no recent news"
+        if bool(settings.get("hold_on_any_recent_news", False)):
+            return False, f"blocked: {len(articles)} recent news item(s)"
+
+        keywords = [str(keyword).lower() for keyword in settings.get("block_keywords", [])]
+        for article in articles:
+            text = news_article_text(article)
+            for keyword in keywords:
+                if keyword and keyword in text:
+                    return False, f"blocked: news keyword '{keyword}'"
+
+        return True, f"news ok: {len(articles)} recent item(s)"
+
     def load_training_frame(self, start: date, end: date) -> pd.DataFrame:
         fetch_start = start - timedelta(days=int(self.config["ml"]["feature_lookback_days"]) * 3)
         bars_by_symbol = self.backtester.fetch_daily_bars(self.config["watchlist"], fetch_start, end)
@@ -772,6 +1028,43 @@ class MLStrategy:
 
 def parse_hhmm_time(value: str) -> time:
     return datetime.strptime(value, "%H:%M").time()
+
+
+def extract_news_articles(response: Any) -> list[Any]:
+    raw_articles = getattr(response, "data", getattr(response, "news", response))
+    if isinstance(raw_articles, dict):
+        articles: list[Any] = []
+        for value in raw_articles.values():
+            if isinstance(value, list):
+                articles.extend(value)
+            else:
+                articles.append(value)
+        return articles
+    if raw_articles is None:
+        return []
+    try:
+        return list(raw_articles)
+    except TypeError:
+        return [raw_articles]
+
+
+def news_article_text(article: Any) -> str:
+    fields = [
+        getattr(article, "headline", ""),
+        getattr(article, "summary", ""),
+        getattr(article, "content", ""),
+        getattr(article, "author", ""),
+    ]
+    if isinstance(article, dict):
+        fields.extend(
+            [
+                article.get("headline", ""),
+                article.get("summary", ""),
+                article.get("content", ""),
+                article.get("author", ""),
+            ]
+        )
+    return " ".join(str(value).lower() for value in fields if value)
 
 
 def submit_ml_decisions(
@@ -893,6 +1186,7 @@ def build_feature_frame(
             row = build_feature_row(symbol=symbol, bars=bars, index=index)
             future_close = bars[index + horizon_days].close
             row["target"] = int((future_close / bars[index].close - 1) >= target_return)
+            row["target_date"] = bars[index + horizon_days].timestamp.date()
             row["future_return_pct"] = (future_close / bars[index].close - 1) * 100
             rows.append(row)
 
