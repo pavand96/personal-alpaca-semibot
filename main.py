@@ -62,6 +62,7 @@ _DATE_REQUIRED_COMMANDS = frozenset([
 _ALL_COMMANDS = sorted(
     _DATE_REQUIRED_COMMANDS | {
         "monitor", "trade-once", "run", "ml-signal", "ml-trade-once",
+        "news-monitor",                         # scan news for catalyst signals (cron)
         "spike-stream",                         # real-time WebSocket detector (primary)
         "spike-run", "spike-trade",             # fallback polling variants
         "premarket-run", "premarket-trade",     # aliases for spike-run/trade
