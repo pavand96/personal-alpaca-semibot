@@ -1,0 +1,5 @@
+CRON_TZ=America/New_York
+# Start pre-market gap scanner at 8:00 AM ET on weekdays.
+# Scans every 5 minutes for symbols gapping up >= premarket_min_gap_pct.
+# Places extended-hours limit orders; loop exits automatically when market opens.
+0 8 * * 1-5 /home/pavand96/personal-alpaca-semibot/scripts/run_premarket.sh >> /home/pavand96/personal-alpaca-semibot/logs/premarket.log 2>&1

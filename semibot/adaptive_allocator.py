@@ -80,11 +80,16 @@ class BuzzSnapshot:
 
 
 class AdaptiveSemiPortfolioBacktester(Backtester):
-    def trade_once(self, execute: bool = False) -> list[Decision]:
+    def trade_once(self, execute: bool = False, premarket: bool = False) -> list[Decision]:
         bot = SemiMomentumBot(self.config, api_key=self.api_key, secret_key=self.secret_key)
         bot.assert_account_can_trade()
-        if self.config["risk"]["require_market_open"] and not bot.trading.get_clock().is_open:  # type: ignore[union-attr]
+        clock = bot.trading.get_clock()  # type: ignore[union-attr]
+        market_open = bool(getattr(clock, "is_open", False))
+        if not premarket and self.config["risk"]["require_market_open"] and not market_open:
             print("Market is closed. No adaptive orders submitted.")
+            return []
+        if premarket and market_open:
+            print("Market is open — use regular 'run' command instead of premarket.")
             return []
 
         positions = bot.get_positions()
@@ -104,18 +109,19 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
             print("Daily loss kill switch active. No adaptive orders submitted.")
             return []
 
-        decisions = self.live_decisions(bot=bot, positions=positions)
+        decisions = self.live_decisions(bot=bot, positions=positions, premarket=premarket)
         submitted = submit_adaptive_decisions(
             bot=bot,
             decisions=decisions,
             dry_run=bool(self.config["risk"]["dry_run"]) or not execute,
             max_orders=int(self.config["risk"]["max_orders_per_run"]),
+            extended_hours=premarket,
         )
         if not submitted:
             print("No adaptive trade signals.")
         return submitted
 
-    def live_decisions(self, bot: SemiMomentumBot, positions: dict[str, Any]) -> list[Decision]:
+    def live_decisions(self, bot: SemiMomentumBot, positions: dict[str, Any], premarket: bool = False) -> list[Decision]:
         settings = self.config["adaptive_semis_allocator"]
         overlay_settings = self.config.get("buzz_earnings_overlay", {})
         current_date = datetime.now(MARKET_TZ).date()
@@ -162,6 +168,8 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
         high_proximity_weight = float(settings.get("high_proximity_weight", 15.0))
         sma_alignment_weight = float(settings.get("sma_alignment_weight", 12.0))
         trend_consistency_weight = float(settings.get("trend_consistency_weight", 8.0))
+        gap_boost_weight = float(settings.get("gap_boost_weight", 0.0))
+        gap_boost_min_pct = float(settings.get("gap_boost_min_pct", 2.0))
         score_proportional_sizing = bool(settings.get("score_proportional_sizing", False))
         bull_exposure_pct = float(settings.get("bull_exposure_pct", 0.0))
         bull_max_symbols = int(settings.get("bull_max_symbols", max_symbols))
@@ -194,6 +202,8 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
         risk_bars_by_symbol = self.fetch_daily_bars(risk_filter_symbols, fetch_start, current_date) if risk_filter_symbols else {}
         latest_prices = fetch_live_prices(bot, self.config["watchlist"])
         overlay_bars = live_overlay_bars(bars_by_symbol=bars_by_symbol, prices=latest_prices, current_date=current_date)
+        # Always compute gaps in premarket mode (for filtering); otherwise only when boost is active
+        gap_by_symbol = _compute_gap_by_symbol(latest_prices, bars_by_symbol) if (gap_boost_weight > 0 or premarket) else None
         overlay_positions = backtest_positions_from_live(self.config["watchlist"], positions)
 
         news_by_symbol = fetch_news_by_symbol(
@@ -253,6 +263,9 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
             high_proximity_weight=high_proximity_weight,
             sma_alignment_weight=sma_alignment_weight,
             trend_consistency_weight=trend_consistency_weight,
+            gap_by_symbol=gap_by_symbol,
+            gap_boost_weight=gap_boost_weight,
+            gap_boost_min_pct=gap_boost_min_pct,
         )
         candidates = apply_buzz_earnings_overlay(
             candidates=candidates,
@@ -356,13 +369,26 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
             buy_notional = max(0.0, min(total_pool * alloc_weights[idx] - held_value, buying_power - queued_buys))
             if buy_notional < min_trade_notional:
                 continue
+            # In pre-market mode, only buy symbols with a confirmed large gap
+            if premarket and gap_by_symbol is not None:
+                premarket_min_gap = float(settings.get("premarket_min_gap_pct", 4.0))
+                premarket_max_gap = float(settings.get("premarket_max_gap_pct", 20.0))
+                gap = gap_by_symbol.get(candidate.symbol, 0.0)
+                if not (premarket_min_gap <= gap <= premarket_max_gap):
+                    print(f"PRE-MARKET SKIP {candidate.symbol}: gap={gap:.1f}% (need {premarket_min_gap:.1f}%–{premarket_max_gap:.1f}%)")
+                    continue
+
             queued_buys += buy_notional
+            gap_note = ""
+            if gap_by_symbol:
+                gap_pct = gap_by_symbol.get(candidate.symbol, 0.0)
+                gap_note = f" gap={gap_pct:+.1f}%"
             decisions.append(
                 Decision(
                     candidate.symbol,
                     "buy",
                     (
-                        f"adaptive target score={candidate.score:.2f}; "
+                        f"adaptive target score={candidate.score:.2f}{gap_note}; "
                         f"sector={sector_return:.2f}% slow={sector_slow_return:.2f}% dd={sector_drawdown:.2f}%"
                     ),
                     notional=buy_notional,
@@ -748,6 +774,9 @@ def rank_adaptive_candidates(
     high_proximity_weight: float = 15.0,
     sma_alignment_weight: float = 12.0,
     trend_consistency_weight: float = 8.0,
+    gap_by_symbol: dict[str, float] | None = None,
+    gap_boost_weight: float = 0.0,
+    gap_boost_min_pct: float = 2.0,
 ) -> list[AdaptiveCandidate]:
     sector_return = sector_return_pct(bars_by_symbol, current_date, sector_lookback)
     if sector_return < min_sector_return:
@@ -813,6 +842,12 @@ def rank_adaptive_candidates(
             + sector_return * sector_weight_score
             + (high_proximity - 0.8) * high_proximity_weight
         )
+
+        # Intraday gap boost: reward stocks with a large gap vs prior close (pre-market move)
+        if gap_by_symbol and gap_boost_weight > 0:
+            gap_pct = gap_by_symbol.get(symbol, 0.0)
+            if gap_pct >= gap_boost_min_pct:
+                score += gap_pct * gap_boost_weight
 
         sma_alignment = 0.0
         if use_sma_alignment:
@@ -1287,6 +1322,22 @@ def fetch_live_prices(bot: SemiMomentumBot, symbols: list[str]) -> dict[str, flo
     return prices
 
 
+def _compute_gap_by_symbol(
+    latest_prices: dict[str, float],
+    bars_by_symbol: dict[str, list[DailyBar]],
+) -> dict[str, float]:
+    """Return intraday gap pct (vs prior close) for each symbol with live price data."""
+    gaps: dict[str, float] = {}
+    for symbol, price in latest_prices.items():
+        hist = bars_by_symbol.get(symbol, [])
+        if not hist:
+            continue
+        prev_close = hist[-1].close
+        if prev_close > 0:
+            gaps[symbol] = ((price / prev_close) - 1) * 100
+    return gaps
+
+
 def live_overlay_bars(
     bars_by_symbol: dict[str, list[DailyBar]],
     prices: dict[str, float],
@@ -1338,6 +1389,7 @@ def submit_adaptive_decisions(
     decisions: list[Decision],
     dry_run: bool,
     max_orders: int,
+    extended_hours: bool = False,
 ) -> list[Decision]:
     submitted: list[Decision] = []
     for decision in decisions:
@@ -1351,7 +1403,7 @@ def submit_adaptive_decisions(
             print(f"ADAPTIVE DRY RUN {format_decision(decision)}")
             bot.log_decision(decision, event="adaptive_dry_run_order")
         else:
-            bot.submit_order(decision)
+            bot.submit_order(decision, extended_hours=extended_hours)
             bot.log_decision(decision, event="adaptive_submitted_order")
         submitted.append(decision)
     return submitted

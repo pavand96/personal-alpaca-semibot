@@ -193,9 +193,12 @@ class SemiMomentumBot:
     def get_positions(self) -> dict[str, Any]:
         return {position.symbol: position for position in self.trading.get_all_positions()}  # type: ignore[union-attr]
 
-    def submit_order(self, decision: Decision) -> None:
+    def submit_order(self, decision: Decision, extended_hours: bool = False) -> None:
         side = OrderSide.BUY if decision.action == "buy" else OrderSide.SELL
         order_type = str(self.config.get("orders", {}).get("type", "market")).lower()
+        # Extended-hours orders must be limit orders (Alpaca requirement)
+        if extended_hours:
+            order_type = "limit"
         request_kwargs: dict[str, Any] = {
             "symbol": decision.symbol,
             "side": side,
@@ -206,12 +209,17 @@ class SemiMomentumBot:
         if order_type == "limit":
             reference_price = self.get_latest_price(decision.symbol)
             offset_bps = float(self.config.get("orders", {}).get("limit_price_offset_bps", 10.0))
+            # Use wider offset pre-market due to larger spreads
+            if extended_hours:
+                offset_bps = float(self.config.get("orders", {}).get("premarket_limit_offset_bps", 25.0))
             limit_price = limit_price_for_side(reference_price, decision.action, offset_bps)
             request_kwargs["limit_price"] = limit_price
             if decision.action == "buy":
                 request_kwargs["qty"] = floor_order_qty(decision.notional, limit_price)
             else:
                 request_kwargs["qty"] = decision.qty
+            if extended_hours:
+                request_kwargs["extended_hours"] = True
             order = LimitOrderRequest(**request_kwargs)
         else:
             if decision.action == "buy":
@@ -221,7 +229,8 @@ class SemiMomentumBot:
             order = MarketOrderRequest(**request_kwargs)  # type: ignore[assignment]
 
         result = self.trading.submit_order(order_data=order)
-        print(f"Submitted {order_type.upper()} {decision.action.upper()} {decision.symbol}: order_id={result.id}")  # type: ignore[union-attr]
+        mode = "PREMARKET" if extended_hours else order_type.upper()
+        print(f"Submitted {mode} {decision.action.upper()} {decision.symbol}: order_id={result.id}")  # type: ignore[union-attr]
 
     def get_latest_price(self, symbol: str) -> float:
         snapshots = self.data.get_stock_snapshot(

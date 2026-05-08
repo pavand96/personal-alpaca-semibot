@@ -212,6 +212,7 @@ risk:
 orders:
   type: limit
   limit_price_offset_bps: 10.0
+  premarket_limit_offset_bps: 25.0  # wider offset pre-market due to larger spreads
 
 live_entry_filter:
   enabled: true
@@ -323,6 +324,7 @@ buzz_earnings_overlay:
 
 runtime:
   interval_seconds: 300
+  premarket_interval_seconds: 300  # how often to re-scan during pre-market window
   log_file: logs/semibot_events.csv
 
 backtest:
@@ -478,6 +480,12 @@ adaptive_semis_allocator:
   slow_momentum_weight: 1.2
   fast_momentum_weight: 2.0
   short_momentum_weight: 0.8
+  # Pre-market gap capture: boost ranking of stocks with large intraday gaps vs prior close
+  gap_boost_weight: 4.0        # score points per % of gap (e.g. 6% gap * 4.0 = +24 score points)
+  gap_boost_min_pct: 2.0       # minimum gap % to trigger boost
+  # Pre-market extended-hours orders (used by premarket-run/premarket-trade commands)
+  premarket_min_gap_pct: 4.0   # only enter pre-market if gap >= 4%
+  premarket_max_gap_pct: 20.0  # skip if gap > 20% (too extended, execution risk)
   score_proportional_sizing: true
   bull_exposure_pct: 0.80
   bull_max_symbols: 5

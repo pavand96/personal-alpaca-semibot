@@ -57,7 +57,7 @@ _DATE_REQUIRED_COMMANDS = frozenset([
 ])
 
 _ALL_COMMANDS = sorted(
-    _DATE_REQUIRED_COMMANDS | {"monitor", "trade-once", "run", "ml-signal", "ml-trade-once"}
+    _DATE_REQUIRED_COMMANDS | {"monitor", "trade-once", "run", "ml-signal", "ml-trade-once", "premarket-run", "premarket-trade"}
 )
 
 
@@ -186,6 +186,27 @@ def main() -> None:
     def cmd_trade_once() -> None:
         AdaptiveSemiPortfolioBacktester(config, api_key=api_key, secret_key=secret_key).trade_once(execute=args.execute)
 
+    def cmd_premarket_trade() -> None:
+        AdaptiveSemiPortfolioBacktester(config, api_key=api_key, secret_key=secret_key).trade_once(execute=args.execute, premarket=True)
+
+    def cmd_premarket_run() -> None:
+        """Run pre-market gap scanner in a loop until market opens."""
+        bot = AdaptiveSemiPortfolioBacktester(config, api_key=api_key, secret_key=secret_key)
+        interval = int(config["runtime"].get("premarket_interval_seconds", 300))
+        while True:
+            print(time.strftime("%Y-%m-%d %H:%M:%S"), "pre-market gap scan")
+            try:
+                from semibot.bot import SemiMomentumBot
+                clock_bot = SemiMomentumBot(config, api_key=api_key, secret_key=secret_key)
+                clock = clock_bot.trading.get_clock()
+                if getattr(clock, "is_open", False):
+                    print("Market opened — pre-market loop exiting.")
+                    break
+                bot.trade_once(execute=args.execute, premarket=True)
+            except Exception as exc:
+                print(f"Pre-market scan error: {exc}")
+            time.sleep(interval)
+
     def cmd_run() -> None:
         bot = AdaptiveSemiPortfolioBacktester(config, api_key=api_key, secret_key=secret_key)
         interval = int(config["runtime"]["interval_seconds"])
@@ -213,6 +234,8 @@ def main() -> None:
         "ml-trade-once": cmd_ml_trade_once,
         "monitor": cmd_monitor,
         "trade-once": cmd_trade_once,
+        "premarket-trade": cmd_premarket_trade,
+        "premarket-run": cmd_premarket_run,
         "run": cmd_run,
     }
     commands[args.command]()
