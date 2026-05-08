@@ -68,6 +68,7 @@ class AdaptiveCandidate:
     sma_alignment: float = 0.0
     relative_strength: float = 0.0
     trend_consistency: float = 0.0
+    momentum_acceleration: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -151,6 +152,8 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
         use_sma_alignment = bool(settings.get("use_sma_alignment", False))
         use_relative_strength = bool(settings.get("use_relative_strength", False))
         use_trend_consistency = bool(settings.get("use_trend_consistency", False))
+        use_momentum_acceleration = bool(settings.get("use_momentum_acceleration", False))
+        momentum_acceleration_weight = float(settings.get("momentum_acceleration_weight", 6.0))
         score_proportional_sizing = bool(settings.get("score_proportional_sizing", False))
         bull_exposure_pct = float(settings.get("bull_exposure_pct", 0.0))
         bull_max_symbols = int(settings.get("bull_max_symbols", max_symbols))
@@ -224,6 +227,8 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
             use_sma_alignment=use_sma_alignment,
             use_relative_strength=use_relative_strength,
             use_trend_consistency=use_trend_consistency,
+            use_momentum_acceleration=use_momentum_acceleration,
+            momentum_acceleration_weight=momentum_acceleration_weight,
         )
         candidates = apply_buzz_earnings_overlay(
             candidates=candidates,
@@ -386,6 +391,8 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
         use_sma_alignment = bool(settings.get("use_sma_alignment", False))
         use_relative_strength = bool(settings.get("use_relative_strength", False))
         use_trend_consistency = bool(settings.get("use_trend_consistency", False))
+        use_momentum_acceleration = bool(settings.get("use_momentum_acceleration", False))
+        momentum_acceleration_weight = float(settings.get("momentum_acceleration_weight", 6.0))
         score_proportional_sizing = bool(settings.get("score_proportional_sizing", False))
         bull_exposure_pct = float(settings.get("bull_exposure_pct", 0.0))
         bull_max_symbols = int(settings.get("bull_max_symbols", max_symbols))
@@ -516,6 +523,8 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
                     use_sma_alignment=use_sma_alignment,
                     use_relative_strength=use_relative_strength,
                     use_trend_consistency=use_trend_consistency,
+                    use_momentum_acceleration=use_momentum_acceleration,
+                    momentum_acceleration_weight=momentum_acceleration_weight,
                 )
                 candidates = apply_buzz_earnings_overlay(
                     candidates=candidates,
@@ -677,6 +686,8 @@ def rank_adaptive_candidates(
     use_sma_alignment: bool = False,
     use_relative_strength: bool = False,
     use_trend_consistency: bool = False,
+    use_momentum_acceleration: bool = False,
+    momentum_acceleration_weight: float = 6.0,
 ) -> list[AdaptiveCandidate]:
     sector_return = sector_return_pct(bars_by_symbol, current_date, sector_lookback)
     if sector_return < min_sector_return:
@@ -752,6 +763,15 @@ def rank_adaptive_candidates(
             trend_consistency = up_days / fast_lookback
             score += trend_consistency * 8.0
 
+        # Momentum acceleration: fast period gaining more per day than slow period
+        # accel_ratio > 1 means the stock is speeding up (early breakout); < 1 = fading
+        momentum_acceleration = 0.0
+        if use_momentum_acceleration and slow_return > 0 and slow_lookback > 0:
+            expected_fast = slow_return * fast_lookback / slow_lookback
+            accel_ratio = fast_return / max(expected_fast, 0.1)
+            momentum_acceleration = accel_ratio - 1.0
+            score += max(-5.0, min(12.0, momentum_acceleration * momentum_acceleration_weight))
+
         candidates.append(
             AdaptiveCandidate(
                 symbol=symbol,
@@ -762,6 +782,7 @@ def rank_adaptive_candidates(
                 sma_alignment=sma_alignment,
                 relative_strength=relative_strength,
                 trend_consistency=trend_consistency,
+                momentum_acceleration=momentum_acceleration,
             )
         )
     return sorted(candidates, key=lambda item: item.score, reverse=True)

@@ -473,6 +473,8 @@ adaptive_semis_allocator:
   use_sma_alignment: true
   use_relative_strength: true
   use_trend_consistency: true
+  use_momentum_acceleration: false
+  momentum_acceleration_weight: 6.0
   score_proportional_sizing: true
   bull_exposure_pct: 0.80
   bull_max_symbols: 5

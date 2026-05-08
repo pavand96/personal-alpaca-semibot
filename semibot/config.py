@@ -431,6 +431,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "use_sma_alignment": True,
         "use_relative_strength": True,
         "use_trend_consistency": True,
+        "use_momentum_acceleration": False,
+        "momentum_acceleration_weight": 6.0,
         "score_proportional_sizing": True,
         "bull_exposure_pct": 0.80,
         "bull_max_symbols": 5,
