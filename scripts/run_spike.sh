@@ -1,18 +1,17 @@
 #!/usr/bin/env bash
-# Extended-hours spike scanner — covers pre-market (4am–9:30am) and after-hours (4:15pm–7:45pm ET).
+# Real-time extended-hours spike detector.
 #
 # Usage: run_spike.sh [premarket|afterhours]
-#   premarket  — started at 4:00 AM ET; loop exits when market opens
-#   afterhours — started at 4:15 PM ET; loop exits at 7:45 PM ET
+#   premarket  — started at 4:00 AM ET; stream exits when market opens at 9:30 AM
+#   afterhours — started at 4:15 PM ET; stream exits at 7:45 PM ET
 #
-# Both windows use the same spike-run command; the time-aware reference logic inside
-# fetch_extended_hours_gaps() picks the right close price automatically.
+# Uses Alpaca WebSocket trade stream (spike-stream command).
+# On every incoming trade, gap = (trade.price / last_regular_close) - 1.
+# If gap >= spike_min_gap_pct, an extended-hours limit order fires immediately (~200ms latency).
+# Each symbol is only ordered once per session.
 #
-# Scans every spike_interval_seconds (default 60s).
-# Symbols already ordered this session are not re-entered.
-#
-# IMPORTANT: Currently DRY-RUN. Add --execute once you have observed a few sessions
-# of dry-run output and confirmed the thresholds and notional are appropriate.
+# IMPORTANT: Currently DRY-RUN only. Add --execute once you have watched
+# several sessions of dry-run output and confirmed the thresholds are correct.
 
 set -euo pipefail
 
@@ -28,9 +27,9 @@ cd "$PROJECT_DIR"
 
 log() { echo "$(date '+%Y-%m-%dT%H:%M:%S%z') $*" | tee -a "$LOG_FILE"; }
 
-log "INFO  spike scanner started (window=$WINDOW)"
+log "INFO  spike-stream starting (window=$WINDOW)"
 
-# Remove --dry-run flag (or add --execute) once thresholds are validated.
-.venv/bin/python main.py spike-run >> "$LOG_FILE" 2>&1
+# Add --execute below once dry-run is validated.
+.venv/bin/python main.py spike-stream >> "$LOG_FILE" 2>&1
 
-log "INFO  spike scanner finished (window=$WINDOW)"
+log "INFO  spike-stream stopped (window=$WINDOW)"

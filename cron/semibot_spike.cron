@@ -1,8 +1,10 @@
 CRON_TZ=America/New_York
-# Pre-market spike scanner: starts at 4:00 AM ET, exits when market opens at 9:30 AM.
-# Scans every 60s for any watchlist symbol gapping >= spike_min_gap_pct vs yesterday's close.
+# Pre-market spike stream: starts at 4:00 AM ET.
+# WebSocket detects trades in real time; order fires within ~200ms of a qualifying spike.
+# Stream exits automatically when market opens at 9:30 AM.
 0 4 * * 1-5 /home/pavand96/personal-alpaca-semibot/scripts/run_spike.sh premarket >> /home/pavand96/personal-alpaca-semibot/logs/spike_premarket.log 2>&1
 
-# After-hours spike scanner: starts at 4:15 PM ET, exits at 7:45 PM ET.
-# Scans every 60s for any watchlist symbol gapping >= spike_min_gap_pct vs today's 4pm close.
+# After-hours spike stream: starts at 4:15 PM ET.
+# Detects spikes vs today's 4pm close in real time.
+# Stream exits automatically at 7:45 PM ET (before Alpaca's 8pm extended-hours cutoff).
 15 16 * * 1-5 /home/pavand96/personal-alpaca-semibot/scripts/run_spike.sh afterhours >> /home/pavand96/personal-alpaca-semibot/logs/spike_afterhours.log 2>&1

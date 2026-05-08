@@ -59,9 +59,10 @@ _DATE_REQUIRED_COMMANDS = frozenset([
 _ALL_COMMANDS = sorted(
     _DATE_REQUIRED_COMMANDS | {
         "monitor", "trade-once", "run", "ml-signal", "ml-trade-once",
-        "spike-run", "spike-trade",
-        "premarket-run", "premarket-trade",   # aliases for spike-run/trade
-        "afterhours-run", "afterhours-trade",  # aliases for spike-run/trade
+        "spike-stream",                         # real-time WebSocket detector (primary)
+        "spike-run", "spike-trade",             # fallback polling variants
+        "premarket-run", "premarket-trade",     # aliases for spike-run/trade
+        "afterhours-run", "afterhours-trade",   # aliases for spike-run/trade
     }
 )
 
@@ -191,6 +192,13 @@ def main() -> None:
     def cmd_trade_once() -> None:
         AdaptiveSemiPortfolioBacktester(config, api_key=api_key, secret_key=secret_key).trade_once(execute=args.execute)
 
+    def cmd_spike_stream() -> None:
+        """Real-time WebSocket spike detector. Fires orders in ~200ms of a qualifying trade."""
+        from semibot.spike_stream import SpikeStreamScanner
+        scanner = SpikeStreamScanner(config, api_key=api_key, secret_key=secret_key)
+        scanner.load_references()
+        scanner.run(execute=args.execute)
+
     def cmd_spike_trade() -> None:
         """One-shot: detect current pre-market or after-hours spike and order immediately."""
         AdaptiveSemiPortfolioBacktester(config, api_key=api_key, secret_key=secret_key).spike_scan(execute=args.execute)
@@ -278,6 +286,7 @@ def main() -> None:
         "trade-once": cmd_trade_once,
         "premarket-trade": cmd_premarket_trade,
         "premarket-run": cmd_premarket_run,
+        "spike-stream": cmd_spike_stream,
         "spike-trade": cmd_spike_trade,
         "spike-run": cmd_spike_run,
         "afterhours-trade": cmd_afterhours_trade,
