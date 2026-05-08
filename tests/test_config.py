@@ -69,6 +69,35 @@ risk:
         load_config(config_path)
 
 
+def test_load_config_rejects_ml_per_trade_notional_exceeding_max_position(tmp_path) -> None:
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        """
+ml:
+  per_trade_notional: 500.0
+  max_position_notional: 100.0
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="ml.per_trade_notional cannot exceed ml.max_position_notional"):
+        load_config(config_path)
+
+
+def test_load_config_rejects_negative_ml_stop_loss(tmp_path) -> None:
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        """
+ml:
+  stop_loss_pct: -1.0
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="stop_loss_pct must be positive"):
+        load_config(config_path)
+
+
 def test_load_config_accepts_max_daily_loss_pct_zero(tmp_path) -> None:
     config_path = tmp_path / "config.yml"
     config_path.write_text(

@@ -271,6 +271,16 @@ def validate_config(config: dict[str, Any]) -> None:
     require_non_negative(config["risk"], "max_daily_loss_pct")
     validate_hhmm(config["risk"], "exit_before_close")
 
+    ml = config.get("ml", {})
+    for key in ("stop_loss_pct", "trailing_stop_pct", "take_profit_pct", "per_trade_notional", "max_position_notional"):
+        if key in ml:
+            require_positive(ml, key)
+    if "max_symbols_to_buy_per_run" in ml:
+        require_non_negative(ml, "max_symbols_to_buy_per_run")
+    if "per_trade_notional" in ml and "max_position_notional" in ml:
+        if float(ml["per_trade_notional"]) > float(ml["max_position_notional"]):
+            raise ValueError("ml.per_trade_notional cannot exceed ml.max_position_notional")
+
     order_type = str(config["orders"].get("type", "market")).lower()
     if order_type not in {"market", "limit"}:
         raise ValueError("orders.type must be market or limit")

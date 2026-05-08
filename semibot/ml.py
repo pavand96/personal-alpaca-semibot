@@ -496,7 +496,7 @@ class MLStrategy:
                     bot=bot,
                     decisions=decisions,
                     dry_run=bool(self.config["risk"]["dry_run"]) or not execute,
-                    max_orders=int(self.config["risk"]["max_orders_per_run"]),
+                    max_orders=len(decisions),
                 )
             print("Daily loss kill switch active. No ML orders submitted.")
             return []

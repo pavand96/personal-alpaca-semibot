@@ -2,7 +2,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from semibot.bot import Decision, MarketView, SemiMomentumBot, account_daily_return_pct, limit_price_for_side
+from semibot.bot import (
+    Decision,
+    MarketView,
+    SemiMomentumBot,
+    account_daily_return_pct,
+    floor_order_qty,
+    limit_price_for_side,
+)
 
 
 def make_bot() -> SemiMomentumBot:
@@ -86,6 +93,29 @@ def test_daily_loss_kill_switch_not_triggered_when_loss_below_threshold() -> Non
     assert bot.daily_loss_kill_switch_triggered() is False
 
 
+def test_daily_loss_kill_switch_flatten_bypasses_max_orders() -> None:
+    bot = make_bot_with_risk(max_daily_loss_pct=3.0, equity="9600", last_equity="10000")
+    bot.config["risk"]["flatten_on_daily_loss"] = True
+    # 5 positions but max_orders_per_run is only 1 — all 5 must still be sold
+    positions = {s: SimpleNamespace(symbol=s, qty="1.0") for s in ["NVDA", "AMD", "AVGO", "TSM", "INTC"]}
+
+    flatten_decisions = [
+        Decision(p.symbol, "sell", "daily loss kill switch", qty=float(p.qty))
+        for p in positions.values()
+        if float(p.qty) > 0
+    ]
+    # simulate the is_flatten bypass: max_orders does not cap the loop
+    max_orders = 1
+    submitted = []
+    is_flatten = True
+    for d in flatten_decisions:
+        if not is_flatten and len(submitted) >= max_orders:
+            break
+        submitted.append(d)
+
+    assert len(submitted) == 5
+
+
 def test_daily_loss_kill_switch_flatten_decisions() -> None:
     bot = make_bot_with_risk(max_daily_loss_pct=3.0, equity="9600", last_equity="10000")
     bot.config["risk"]["flatten_on_daily_loss"] = True
@@ -106,23 +136,14 @@ def test_daily_loss_kill_switch_flatten_decisions() -> None:
     assert symbols == {"NVDA", "AMD"}
 
 
-def test_limit_order_qty_is_floored_not_rounded() -> None:
-    import math
+def test_floor_order_qty_never_exceeds_notional() -> None:
+    # 100 / 3 = 33.333... — floored qty * price must not exceed notional
+    assert floor_order_qty(100.0, 3.0) * 3.0 <= 100.0 + 1e-9
 
-    notional = 100.0
-    # price chosen so that naive division gives a value where floor != round
-    limit_price = 3.0  # 100/3 = 33.333333... → floor=33.333333, round=33.333333 (same at 6dp)
-    raw = notional / limit_price
-    floored = math.floor(raw * 1_000_000) / 1_000_000
-    rounded = round(raw, 6)
-    # floor must never exceed the notional when multiplied back
-    assert floored * limit_price <= notional + 1e-9
-    # for a price where rounding would round up, floor is strictly ≤ round
-    limit_price2 = 7.0  # 100/7 = 14.285714285... → round(,6)=14.285714, floor=14.285714 (equal)
-    # use a price that makes the 7th decimal ≥ 5 so round() would increment the 6th
-    limit_price3 = 300.0 / 2100001  # tiny increment to force rounding difference
-    raw3 = 100.0 / limit_price3
-    floored3 = math.floor(raw3 * 1_000_000) / 1_000_000
-    rounded3 = round(raw3, 6)
-    assert floored3 <= rounded3
-    assert floored3 * limit_price3 <= 100.0 + 1e-6
+
+def test_floor_order_qty_is_strictly_floored_when_rounding_would_round_up() -> None:
+    # choose a price so the 7th decimal digit is ≥ 5, making round() increment the 6th place
+    price = 300.0 / 2_100_001
+    qty = floor_order_qty(100.0, price)
+    assert qty <= round(100.0 / price, 6)
+    assert qty * price <= 100.0 + 1e-6

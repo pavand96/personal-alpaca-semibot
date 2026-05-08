@@ -67,6 +67,7 @@ class SemiMomentumBot:
 
         dry_run = bool(self.config["risk"]["dry_run"]) or not execute
         max_orders = int(self.config["risk"]["max_orders_per_run"])
+        is_flatten = False
         if self.daily_loss_kill_switch_triggered():
             positions = self.get_positions()
             if self.config["risk"].get("flatten_on_daily_loss", True):
@@ -75,6 +76,7 @@ class SemiMomentumBot:
                     for position in positions.values()
                     if float(position.qty) > 0
                 ]
+                is_flatten = True
             else:
                 print("Daily loss kill switch active. No orders submitted.")
                 return []
@@ -83,7 +85,7 @@ class SemiMomentumBot:
 
         submitted: list[Decision] = []
         for decision in decisions:
-            if len(submitted) >= max_orders:
+            if not is_flatten and len(submitted) >= max_orders:
                 break
             if decision.action == "hold":
                 continue
@@ -207,7 +209,7 @@ class SemiMomentumBot:
             limit_price = limit_price_for_side(reference_price, decision.action, offset_bps)
             request_kwargs["limit_price"] = limit_price
             if decision.action == "buy":
-                request_kwargs["qty"] = math.floor(decision.notional / limit_price * 1_000_000) / 1_000_000
+                request_kwargs["qty"] = floor_order_qty(decision.notional, limit_price)
             else:
                 request_kwargs["qty"] = decision.qty
             order = LimitOrderRequest(**request_kwargs)
@@ -302,6 +304,11 @@ def account_daily_return_pct(account: Any) -> float:
     if last_equity <= 0:
         return 0.0
     return ((equity / last_equity) - 1) * 100
+
+
+def floor_order_qty(notional: float, price: float) -> float:
+    """Floor fractional share quantity to 6 decimal places to avoid spending over notional."""
+    return math.floor(notional / price * 1_000_000) / 1_000_000
 
 
 def limit_price_for_side(reference_price: float, action: str, offset_bps: float) -> float:

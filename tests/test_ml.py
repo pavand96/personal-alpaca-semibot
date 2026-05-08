@@ -107,8 +107,6 @@ def test_ml_live_uses_ml_override_per_trade_notional() -> None:
 def test_ml_live_uses_ml_override_stop_loss() -> None:
     strategy = make_ml_strategy()
 
-    captured_stop: list[float] = []
-
     fake_bot = MagicMock(unsafe=True)
     fake_bot.daily_loss_kill_switch_triggered.return_value = False
     fake_bot.trading.get_clock.return_value = SimpleNamespace(is_open=True)
