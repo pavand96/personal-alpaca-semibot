@@ -324,8 +324,7 @@ buzz_earnings_overlay:
 
 runtime:
   interval_seconds: 300
-  premarket_interval_seconds: 300   # how often to re-scan during pre-market window
-  afterhours_interval_seconds: 300  # how often to re-scan during after-hours window (4:15–7:45pm ET)
+  spike_interval_seconds: 60        # scan every 60s — fast enough to catch most spikes within 1 minute
   log_file: logs/semibot_events.csv
 
 backtest:
@@ -487,11 +486,12 @@ adaptive_semis_allocator:
   # Pre-market extended-hours orders (used by premarket-run/premarket-trade commands)
   premarket_min_gap_pct: 4.0   # only enter pre-market if gap >= 4%
   premarket_max_gap_pct: 20.0  # skip if gap > 20% (too extended, execution risk)
-  # After-hours spike capture (used by afterhours-run/afterhours-trade commands)
-  # Compares latest after-hours trade to today's 4pm regular-session close.
-  afterhours_min_gap_pct: 3.0          # enter if spike >= 3% vs today's close
-  afterhours_max_gap_pct: 20.0         # skip if spike > 20% (gap risk on reversal)
-  afterhours_notional_per_trade: 1000.0  # notional per position (conservative — adjust once validated)
+  # Extended-hours spike capture (spike-run/spike-trade; also premarket-* and afterhours-* aliases)
+  # Pre-market:  gap = (current price / yesterday's 4pm close) - 1
+  # After-hours: gap = (current price / today's 4pm close) - 1
+  spike_min_gap_pct: 3.0          # enter if spike >= 3%
+  spike_max_gap_pct: 20.0         # skip if spike > 20% (reversal risk)
+  spike_notional_per_trade: 1000.0  # notional per position — increase once validated
   score_proportional_sizing: true
   bull_exposure_pct: 0.80
   bull_max_symbols: 5

@@ -59,8 +59,9 @@ _DATE_REQUIRED_COMMANDS = frozenset([
 _ALL_COMMANDS = sorted(
     _DATE_REQUIRED_COMMANDS | {
         "monitor", "trade-once", "run", "ml-signal", "ml-trade-once",
-        "premarket-run", "premarket-trade",
-        "afterhours-run", "afterhours-trade",
+        "spike-run", "spike-trade",
+        "premarket-run", "premarket-trade",   # aliases for spike-run/trade
+        "afterhours-run", "afterhours-trade",  # aliases for spike-run/trade
     }
 )
 
@@ -190,48 +191,63 @@ def main() -> None:
     def cmd_trade_once() -> None:
         AdaptiveSemiPortfolioBacktester(config, api_key=api_key, secret_key=secret_key).trade_once(execute=args.execute)
 
+    def cmd_spike_trade() -> None:
+        """One-shot: detect current pre-market or after-hours spike and order immediately."""
+        AdaptiveSemiPortfolioBacktester(config, api_key=api_key, secret_key=secret_key).spike_scan(execute=args.execute)
+
+    def cmd_spike_run() -> None:
+        """Continuous spike scanner — runs during pre-market (4am–9:30am) and after-hours (4:15pm–7:45pm ET).
+
+        Scans every spike_interval_seconds (default 60s).
+        Tracks symbols already ordered this session to prevent duplicates.
+        Exits when market opens (pre-market window) or at 7:45pm ET (after-hours window).
+        """
+        from zoneinfo import ZoneInfo
+        _tz = ZoneInfo("America/New_York")
+        import datetime as _dt
+        from semibot.bot import SemiMomentumBot
+
+        bot = AdaptiveSemiPortfolioBacktester(config, api_key=api_key, secret_key=secret_key)
+        interval = int(config["runtime"].get("spike_interval_seconds", 60))
+        ordered_today: set[str] = set()
+
+        print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} spike scanner started (interval={interval}s)")
+
+        while True:
+            now = _dt.datetime.now(_tz)
+            # Hard stop: Alpaca extended hours end at 8pm; stop scanning at 7:45pm
+            if now.hour >= 19 and now.minute >= 45:
+                print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} extended-hours window closed (7:45pm) — exiting")
+                break
+
+            try:
+                clock = SemiMomentumBot(config, api_key=api_key, secret_key=secret_key).trading.get_clock()
+                if getattr(clock, "is_open", False):
+                    print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} market opened — spike scanner exiting")
+                    break
+            except Exception as exc:
+                print(f"Clock check error: {exc}")
+
+            print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} scanning …")
+            try:
+                _, ordered_today = bot.spike_scan(execute=args.execute, already_ordered=ordered_today)
+            except Exception as exc:
+                print(f"Spike scan error: {exc}")
+
+            time.sleep(interval)
+
+    # backward-compat: afterhours-run/trade and premarket-run/trade now all use spike logic
     def cmd_afterhours_trade() -> None:
-        AdaptiveSemiPortfolioBacktester(config, api_key=api_key, secret_key=secret_key).afterhours_scan(execute=args.execute)
+        AdaptiveSemiPortfolioBacktester(config, api_key=api_key, secret_key=secret_key).spike_scan(execute=args.execute)
 
     def cmd_afterhours_run() -> None:
-        """Scan for after-hours spikes every N minutes between 4:15pm and 7:45pm ET."""
-        bot = AdaptiveSemiPortfolioBacktester(config, api_key=api_key, secret_key=secret_key)
-        interval = int(config["runtime"].get("afterhours_interval_seconds", 300))
-        AH_CLOSE_HOUR, AH_CLOSE_MIN = 19, 45  # 7:45pm ET — Alpaca extended hours end at 8pm
-        from zoneinfo import ZoneInfo
-        MARKET_TZ = ZoneInfo("America/New_York")
-        while True:
-            now = __import__("datetime").datetime.now(MARKET_TZ)
-            if now.hour > AH_CLOSE_HOUR or (now.hour == AH_CLOSE_HOUR and now.minute >= AH_CLOSE_MIN):
-                print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} after-hours window closed — exiting loop")
-                break
-            print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} after-hours spike scan")
-            try:
-                bot.afterhours_scan(execute=args.execute)
-            except Exception as exc:
-                print(f"After-hours scan error: {exc}")
-            time.sleep(interval)
+        cmd_spike_run()
 
     def cmd_premarket_trade() -> None:
-        AdaptiveSemiPortfolioBacktester(config, api_key=api_key, secret_key=secret_key).trade_once(execute=args.execute, premarket=True)
+        AdaptiveSemiPortfolioBacktester(config, api_key=api_key, secret_key=secret_key).spike_scan(execute=args.execute)
 
     def cmd_premarket_run() -> None:
-        """Run pre-market gap scanner in a loop until market opens."""
-        bot = AdaptiveSemiPortfolioBacktester(config, api_key=api_key, secret_key=secret_key)
-        interval = int(config["runtime"].get("premarket_interval_seconds", 300))
-        while True:
-            print(time.strftime("%Y-%m-%d %H:%M:%S"), "pre-market gap scan")
-            try:
-                from semibot.bot import SemiMomentumBot
-                clock_bot = SemiMomentumBot(config, api_key=api_key, secret_key=secret_key)
-                clock = clock_bot.trading.get_clock()
-                if getattr(clock, "is_open", False):
-                    print("Market opened — pre-market loop exiting.")
-                    break
-                bot.trade_once(execute=args.execute, premarket=True)
-            except Exception as exc:
-                print(f"Pre-market scan error: {exc}")
-            time.sleep(interval)
+        cmd_spike_run()
 
     def cmd_run() -> None:
         bot = AdaptiveSemiPortfolioBacktester(config, api_key=api_key, secret_key=secret_key)
@@ -262,6 +278,8 @@ def main() -> None:
         "trade-once": cmd_trade_once,
         "premarket-trade": cmd_premarket_trade,
         "premarket-run": cmd_premarket_run,
+        "spike-trade": cmd_spike_trade,
+        "spike-run": cmd_spike_run,
         "afterhours-trade": cmd_afterhours_trade,
         "afterhours-run": cmd_afterhours_run,
         "run": cmd_run,

@@ -80,34 +80,47 @@ class BuzzSnapshot:
 
 
 class AdaptiveSemiPortfolioBacktester(Backtester):
-    def afterhours_scan(self, execute: bool = False) -> list[Decision]:
-        """Detect after-hours spikes and immediately place extended-hours limit orders."""
+    def spike_scan(self, execute: bool = False, already_ordered: set[str] | None = None) -> tuple[list[Decision], set[str]]:
+        """Detect pre-market or after-hours spikes and immediately place extended-hours limit orders.
+
+        Works in both windows:
+          - Pre-market  (4:00am–9:30am ET): gap vs previous_daily_bar.close (yesterday's 4pm close)
+          - After-hours (4:15pm–7:45pm ET): gap vs daily_bar.close (today's 4pm close)
+
+        already_ordered: symbols already entered this session — prevents duplicate orders across
+        repeated loop iterations when an order hasn't filled yet.
+        Returns (submitted_decisions, updated_already_ordered_set).
+        """
+        if already_ordered is None:
+            already_ordered = set()
+
         bot = SemiMomentumBot(self.config, api_key=self.api_key, secret_key=self.secret_key)
         bot.assert_account_can_trade()
         clock = bot.trading.get_clock()  # type: ignore[union-attr]
         if bool(getattr(clock, "is_open", False)):
             print("Market is open — use regular 'run' command for intraday trading.")
-            return []
+            return [], already_ordered
 
         settings = self.config["adaptive_semis_allocator"]
-        min_gap = float(settings.get("afterhours_min_gap_pct", 3.0))
-        max_gap = float(settings.get("afterhours_max_gap_pct", 20.0))
-        notional = float(settings.get("afterhours_notional_per_trade", 1000.0))
+        min_gap = float(settings.get("spike_min_gap_pct", 3.0))
+        max_gap = float(settings.get("spike_max_gap_pct", 20.0))
+        notional = float(settings.get("spike_notional_per_trade", 1000.0))
 
-        gaps = fetch_afterhours_gaps(bot, self.config["watchlist"])
+        gaps = fetch_extended_hours_gaps(bot, self.config["watchlist"])
         if not gaps:
-            print("No after-hours price data available.")
-            return []
+            print("No extended-hours price data available.")
+            return [], already_ordered
 
-        # Log all symbols with meaningful after-hours moves
-        for sym, pct in sorted(gaps.items(), key=lambda x: -abs(x[1])):
-            if abs(pct) >= 1.0:
-                print(f"  AH {sym:6} {pct:+.1f}%")
+        # Log every symbol with a move >= 0.5% so we can monitor in the log
+        meaningful = [(s, g) for s, g in sorted(gaps.items(), key=lambda x: -abs(x[1])) if abs(g) >= 0.5]
+        if meaningful:
+            print("  " + "  ".join(f"{s}:{g:+.1f}%" for s, g in meaningful))
 
         qualifying = {s: g for s, g in gaps.items() if min_gap <= g <= max_gap}
         if not qualifying:
-            print(f"No after-hours spikes >= {min_gap:.1f}% (max watched: {max(gaps.values(), default=0):.1f}%)")
-            return []
+            top = max(gaps.values(), default=0.0)
+            print(f"No spikes >= {min_gap:.1f}% (best: {top:+.1f}%)")
+            return [], already_ordered
 
         positions = bot.get_positions()
         held = {s for s, p in positions.items() if float(getattr(p, "qty", 0)) > 0}
@@ -115,11 +128,14 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
         decisions: list[Decision] = []
         for symbol, gap_pct in sorted(qualifying.items(), key=lambda x: -x[1]):
             if symbol in held:
-                print(f"  SKIP {symbol}: already held")
                 continue
-            print(f"  SPIKE {symbol}: after-hours gap={gap_pct:+.1f}% — queuing extended-hours buy")
+            if symbol in already_ordered:
+                print(f"  ALREADY ORDERED {symbol} ({gap_pct:+.1f}%) — skipping duplicate")
+                continue
+            print(f"  *** SPIKE {symbol}: {gap_pct:+.1f}% vs last close — placing extended-hours order ***")
+            already_ordered.add(symbol)
             decisions.append(
-                Decision(symbol, "buy", f"afterhours spike gap={gap_pct:+.1f}%", notional=notional)
+                Decision(symbol, "buy", f"spike gap={gap_pct:+.1f}%", notional=notional)
             )
 
         submitted = submit_adaptive_decisions(
@@ -129,8 +145,13 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
             max_orders=int(self.config["risk"]["max_orders_per_run"]),
             extended_hours=True,
         )
-        if not submitted:
-            print("No after-hours orders placed.")
+        if decisions and not submitted:
+            print("No spike orders placed.")
+        return submitted, already_ordered
+
+    # backward-compat alias
+    def afterhours_scan(self, execute: bool = False) -> list[Decision]:
+        submitted, _ = self.spike_scan(execute=execute)
         return submitted
 
     def trade_once(self, execute: bool = False, premarket: bool = False) -> list[Decision]:
@@ -1391,13 +1412,20 @@ def _compute_gap_by_symbol(
     return gaps
 
 
-def fetch_afterhours_gaps(bot: SemiMomentumBot, symbols: list[str]) -> dict[str, float]:
-    """Return after-hours gap pct = (latest_trade / today_regular_close) - 1 for each symbol.
+def fetch_extended_hours_gaps(bot: SemiMomentumBot, symbols: list[str]) -> dict[str, float]:
+    """Return extended-hours gap pct vs the most recent regular-session close.
 
-    Uses snapshot.daily_bar.close as the regular-session close reference so the gap
-    reflects the move that happened AFTER the 4pm close, not vs yesterday.
-    Falls back to previous_daily_bar.close if daily_bar is unavailable (pre-market case).
+    Alpaca daily_bar starts at midnight ET and its .close reflects the current/last
+    trade price (not a locked 4pm print).  The correct reference is therefore:
+
+      Pre-market  (before 16:00 ET): previous_daily_bar.close  ← yesterday's 4pm close
+      After-hours (after  16:00 ET): daily_bar.close           ← today's 4pm close (locked)
+
+    gap = (latest_trade.price / reference_close) - 1
     """
+    now_et = datetime.now(MARKET_TZ)
+    use_prev = now_et.hour < 16  # before 4pm ET → pre-market; use yesterday's close
+
     snapshots = bot.data.get_stock_snapshot(
         StockSnapshotRequest(symbol_or_symbols=symbols, feed=bot.feed)
     )
@@ -1410,17 +1438,33 @@ def fetch_afterhours_gaps(bot: SemiMomentumBot, symbols: list[str]) -> dict[str,
         if not latest:
             continue
         price = float(latest.price)
-        # Prefer today's regular-session close; fall back to previous day's close
+
         day_bar = getattr(snapshot, "daily_bar", None)
         prev_bar = getattr(snapshot, "previous_daily_bar", None)
+
+        if use_prev:
+            # Pre-market: yesterday's 4pm close is the reference
+            ref_bar = prev_bar
+            fallback = day_bar
+        else:
+            # After-hours: today's locked 4pm close is the reference
+            ref_bar = day_bar
+            fallback = prev_bar
+
         reference = None
-        if day_bar and getattr(day_bar, "close", None):
-            reference = float(day_bar.close)
-        elif prev_bar and getattr(prev_bar, "close", None):
-            reference = float(prev_bar.close)
+        if ref_bar and getattr(ref_bar, "close", None):
+            reference = float(ref_bar.close)
+        elif fallback and getattr(fallback, "close", None):
+            reference = float(fallback.close)
+
         if reference and reference > 0:
             gaps[symbol] = ((price / reference) - 1) * 100
     return gaps
+
+
+# backward-compat alias for old callers
+def fetch_afterhours_gaps(bot: SemiMomentumBot, symbols: list[str]) -> dict[str, float]:
+    return fetch_extended_hours_gaps(bot, symbols)
 
 
 def live_overlay_bars(
