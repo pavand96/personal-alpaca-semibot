@@ -65,6 +65,9 @@ class AdaptiveCandidate:
     fast_return_pct: float
     slow_return_pct: float
     volume_ratio: float
+    sma_alignment: float = 0.0
+    relative_strength: float = 0.0
+    trend_consistency: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -144,6 +147,11 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
         regime_sma_slow = int(settings.get("regime_sma_slow_days", 200))
         neutral_sizing_pct = float(settings.get("neutral_sizing_pct", 1.0))
         bear_block_entries = bool(settings.get("bear_block_entries", True))
+        symbol_sma_filter_days = int(settings.get("symbol_sma_filter_days", 0))
+        use_sma_alignment = bool(settings.get("use_sma_alignment", False))
+        use_relative_strength = bool(settings.get("use_relative_strength", False))
+        use_trend_consistency = bool(settings.get("use_trend_consistency", False))
+        score_proportional_sizing = bool(settings.get("score_proportional_sizing", False))
 
         max_lookback = max(
             fast_lookback,
@@ -154,6 +162,8 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
             market_momentum_lookback,
             market_sma_days,
             regime_sma_slow if regime_filter_enabled else 0,
+            symbol_sma_filter_days,
+            50,
             30,
         )
         fetch_start = current_date - timedelta(days=max_lookback * 3)
@@ -204,6 +214,10 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
             sector_lookback=sector_lookback,
             min_sector_return=min_sector_return,
             min_symbol_return=min_symbol_return,
+            symbol_sma_filter_days=symbol_sma_filter_days,
+            use_sma_alignment=use_sma_alignment,
+            use_relative_strength=use_relative_strength,
+            use_trend_consistency=use_trend_consistency,
         )
         candidates = apply_buzz_earnings_overlay(
             candidates=candidates,
@@ -278,12 +292,19 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
         equity = float(getattr(account, "equity", 0.0) or 0.0)
         buying_power = float(getattr(account, "buying_power", 0.0) or 0.0)
         regime_mult = neutral_sizing_pct if (regime_filter_enabled and regime == MarketRegime.NEUTRAL) else 1.0
-        target_notional = min(max_total_exposure, equity) * regime_mult / len(selected)
+        total_pool = min(max_total_exposure, equity) * regime_mult
+        if score_proportional_sizing and len(selected) > 1:
+            min_score = min(c.score for c in selected)
+            adj_scores = [c.score - min_score + 1.0 for c in selected]
+            total_adj = sum(adj_scores)
+            alloc_weights = [s / total_adj for s in adj_scores]
+        else:
+            alloc_weights = [1.0 / len(selected)] * len(selected)
         queued_buys = 0.0
-        for candidate in selected:
+        for idx, candidate in enumerate(selected):
             position = positions.get(candidate.symbol)
             held_value = abs(float(getattr(position, "market_value", 0.0) or 0.0)) if position else 0.0
-            buy_notional = max(0.0, min(target_notional - held_value, buying_power - queued_buys))
+            buy_notional = max(0.0, min(total_pool * alloc_weights[idx] - held_value, buying_power - queued_buys))
             if buy_notional < min_trade_notional:
                 continue
             queued_buys += buy_notional
@@ -341,6 +362,11 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
         regime_sma_slow = int(settings.get("regime_sma_slow_days", 200))
         neutral_sizing_pct = float(settings.get("neutral_sizing_pct", 1.0))
         bear_block_entries = bool(settings.get("bear_block_entries", True))
+        symbol_sma_filter_days = int(settings.get("symbol_sma_filter_days", 0))
+        use_sma_alignment = bool(settings.get("use_sma_alignment", False))
+        use_relative_strength = bool(settings.get("use_relative_strength", False))
+        use_trend_consistency = bool(settings.get("use_trend_consistency", False))
+        score_proportional_sizing = bool(settings.get("score_proportional_sizing", False))
 
         max_lookback = max(
             fast_lookback,
@@ -351,6 +377,8 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
             market_momentum_lookback,
             market_sma_days,
             regime_sma_slow if regime_filter_enabled else 0,
+            symbol_sma_filter_days,
+            50,
             30,
         )
         fetch_start = start - timedelta(days=max_lookback * 3)
@@ -436,6 +464,10 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
                     sector_lookback=sector_lookback,
                     min_sector_return=min_sector_return,
                     min_symbol_return=min_symbol_return,
+                    symbol_sma_filter_days=symbol_sma_filter_days,
+                    use_sma_alignment=use_sma_alignment,
+                    use_relative_strength=use_relative_strength,
+                    use_trend_consistency=use_trend_consistency,
                 )
                 candidates = apply_buzz_earnings_overlay(
                     candidates=candidates,
@@ -498,15 +530,22 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
                 selected = candidates[:max_symbols] if not (risk_off or bear_blocked) else []
                 if selected:
                     regime_mult = neutral_sizing_pct if (regime_filter_enabled and regime == MarketRegime.NEUTRAL) else 1.0
-                    target_notional = min(max_total_exposure, cash + market_value(positions, today_bars)) * regime_mult / len(selected)
-                    for candidate in selected:
+                    total_pool = min(max_total_exposure, cash + market_value(positions, today_bars)) * regime_mult
+                    if score_proportional_sizing and len(selected) > 1:
+                        min_score = min(c.score for c in selected)
+                        adj_scores = [c.score - min_score + 1.0 for c in selected]
+                        total_adj = sum(adj_scores)
+                        alloc_weights = [s / total_adj for s in adj_scores]
+                    else:
+                        alloc_weights = [1.0 / len(selected)] * len(selected)
+                    for idx, candidate in enumerate(selected):
                         if candidate.symbol not in today_bars:
                             continue
                         position = positions[candidate.symbol]
                         bar = today_bars[candidate.symbol]
                         price = apply_slippage(bar.open, "buy", slippage_bps)
                         held_value = position.qty * price
-                        buy_notional = max(0.0, min(target_notional - held_value, cash))
+                        buy_notional = max(0.0, min(total_pool * alloc_weights[idx] - held_value, cash))
                         if buy_notional < min_trade_notional:
                             continue
                         qty = buy_notional / price
@@ -581,15 +620,38 @@ def rank_adaptive_candidates(
     sector_lookback: int,
     min_sector_return: float,
     min_symbol_return: float,
+    symbol_sma_filter_days: int = 0,
+    use_sma_alignment: bool = False,
+    use_relative_strength: bool = False,
+    use_trend_consistency: bool = False,
 ) -> list[AdaptiveCandidate]:
     sector_return = sector_return_pct(bars_by_symbol, current_date, sector_lookback)
     if sector_return < min_sector_return:
         return []
 
+    min_bars_needed = max(fast_lookback, slow_lookback, symbol_sma_filter_days, 50, 20)
+
+    # Pre-compute sector average returns for relative strength scoring
+    sector_avg_fast = 0.0
+    sector_avg_slow = 0.0
+    if use_relative_strength:
+        fast_rets: list[float] = []
+        slow_rets: list[float] = []
+        for bars in bars_by_symbol.values():
+            prior_rs = [b for b in bars if b.timestamp.date() < current_date]
+            if len(prior_rs) <= min_bars_needed:
+                continue
+            if prior_rs[-fast_lookback - 1].close > 0:
+                fast_rets.append(((prior_rs[-1].close / prior_rs[-fast_lookback - 1].close) - 1) * 100)
+            if prior_rs[-slow_lookback - 1].close > 0:
+                slow_rets.append(((prior_rs[-1].close / prior_rs[-slow_lookback - 1].close) - 1) * 100)
+        sector_avg_fast = sum(fast_rets) / len(fast_rets) if fast_rets else 0.0
+        sector_avg_slow = sum(slow_rets) / len(slow_rets) if slow_rets else 0.0
+
     candidates: list[AdaptiveCandidate] = []
     for symbol, bars in bars_by_symbol.items():
         prior = [bar for bar in bars if bar.timestamp.date() < current_date]
-        if len(prior) <= max(fast_lookback, slow_lookback, 20):
+        if len(prior) <= min_bars_needed:
             continue
         latest = prior[-1]
         fast_base = prior[-fast_lookback - 1]
@@ -600,9 +662,43 @@ def rank_adaptive_candidates(
         slow_return = ((latest.close / slow_base.close) - 1) * 100
         if fast_return < min_symbol_return or slow_return < min_symbol_return:
             continue
+
+        # Hard SMA gate: discard if price is below the N-day SMA
+        if symbol_sma_filter_days > 0:
+            sma_gate = sum(b.close for b in prior[-symbol_sma_filter_days:]) / symbol_sma_filter_days
+            if latest.close < sma_gate:
+                continue
+
         avg_volume = sum(bar.volume for bar in prior[-20:]) / 20
         volume_ratio = latest.volume / avg_volume if avg_volume > 0 else 1.0
+
+        # Base score: slow momentum + fast momentum + volume confirmation + sector tailwind
         score = slow_return * 0.9 + fast_return * 1.8 + min(volume_ratio, 3.0) * 2.0 + sector_return * 0.5
+
+        # SMA alignment: stacked SMAs (price > SMA20 > SMA50) signal a confirmed uptrend
+        sma_alignment = 0.0
+        if use_sma_alignment:
+            sma20 = sum(b.close for b in prior[-20:]) / 20
+            sma50 = sum(b.close for b in prior[-50:]) / 50
+            sma_alignment = (float(latest.close > sma20) + float(sma20 > sma50)) / 2
+            score += sma_alignment * 12.0
+
+        # Relative strength: outperformance vs equal-weight sector average
+        relative_strength = 0.0
+        if use_relative_strength:
+            rs_fast = fast_return - sector_avg_fast
+            rs_slow = slow_return - sector_avg_slow
+            relative_strength = rs_fast * 1.5 + rs_slow * 0.8
+            score += relative_strength
+
+        # Trend consistency: fraction of up-close days in fast window rewards smooth uptrends
+        trend_consistency = 0.0
+        if use_trend_consistency and len(prior) >= fast_lookback + 1:
+            window = prior[-(fast_lookback + 1):]
+            up_days = sum(1 for j in range(1, len(window)) if window[j].close > window[j - 1].close)
+            trend_consistency = up_days / fast_lookback
+            score += trend_consistency * 8.0
+
         candidates.append(
             AdaptiveCandidate(
                 symbol=symbol,
@@ -610,6 +706,9 @@ def rank_adaptive_candidates(
                 fast_return_pct=fast_return,
                 slow_return_pct=slow_return,
                 volume_ratio=volume_ratio,
+                sma_alignment=sma_alignment,
+                relative_strength=relative_strength,
+                trend_consistency=trend_consistency,
             )
         )
     return sorted(candidates, key=lambda item: item.score, reverse=True)

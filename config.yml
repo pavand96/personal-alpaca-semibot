@@ -467,4 +467,9 @@ adaptive_semis_allocator:
   regime_sma_slow_days: 200
   neutral_sizing_pct: 0.5
   bear_block_entries: true
+  symbol_sma_filter_days: 50
+  use_sma_alignment: true
+  use_relative_strength: true
+  use_trend_consistency: true
+  score_proportional_sizing: true
   trades_file: logs/adaptive_semis_trades.csv

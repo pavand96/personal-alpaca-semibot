@@ -425,6 +425,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "regime_sma_slow_days": 200,
         "neutral_sizing_pct": 0.5,
         "bear_block_entries": True,
+        "symbol_sma_filter_days": 50,
+        "use_sma_alignment": True,
+        "use_relative_strength": True,
+        "use_trend_consistency": True,
+        "score_proportional_sizing": True,
         "trades_file": "logs/adaptive_semis_trades.csv",
     },
 }
