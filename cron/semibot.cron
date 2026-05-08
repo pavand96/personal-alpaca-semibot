@@ -1,0 +1,28 @@
+CRON_TZ=America/New_York
+
+# ── Pre-market spike stream (WebSocket, ~200ms order latency) ─────────────────
+# Starts at 4:00 AM ET. Streams live trades; orders fire the instant 3+ symbols
+# hit the gap threshold. Stream self-exits when market opens at 9:30 AM.
+# Fallback launches at 7:00 and 9:00 AM in case the 4 AM run was missed/crashed.
+# Lock file in the script prevents duplicate stream processes.
+0   4 * * 1-5 /home/pavand96/personal-alpaca-semibot/scripts/run_spike.sh premarket
+0   7 * * 1-5 /home/pavand96/personal-alpaca-semibot/scripts/run_spike.sh premarket
+0   9 * * 1-5 /home/pavand96/personal-alpaca-semibot/scripts/run_spike.sh premarket
+
+# ── Regular session: adaptive-semis strategy ─────────────────────────────────
+# Runs every 5 min from 9:45 AM to 4:10 PM ET.
+# Bot's own require_market_open guard makes it a no-op outside NYSE hours.
+# Also handles spike 1-day hold exits (live_decisions checks spike_tracker.json).
+45,50,55  9 * * 1-5 /home/pavand96/personal-alpaca-semibot/scripts/run_ml_trade.sh
+*/5      10 * * 1-5 /home/pavand96/personal-alpaca-semibot/scripts/run_ml_trade.sh
+*/5      11 * * 1-5 /home/pavand96/personal-alpaca-semibot/scripts/run_ml_trade.sh
+*/5      12 * * 1-5 /home/pavand96/personal-alpaca-semibot/scripts/run_ml_trade.sh
+*/5      13 * * 1-5 /home/pavand96/personal-alpaca-semibot/scripts/run_ml_trade.sh
+*/5      14 * * 1-5 /home/pavand96/personal-alpaca-semibot/scripts/run_ml_trade.sh
+*/5      15 * * 1-5 /home/pavand96/personal-alpaca-semibot/scripts/run_ml_trade.sh
+0,5,10   16 * * 1-5 /home/pavand96/personal-alpaca-semibot/scripts/run_ml_trade.sh
+
+# ── After-hours spike stream (WebSocket) ─────────────────────────────────────
+# Starts at 4:15 PM ET. Streams vs today's locked 4pm close.
+# Self-exits at 7:45 PM (before Alpaca's 8pm extended-hours cutoff).
+15 16 * * 1-5 /home/pavand96/personal-alpaca-semibot/scripts/run_spike.sh afterhours
