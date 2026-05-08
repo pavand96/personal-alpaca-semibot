@@ -5,6 +5,9 @@ alpaca:
   data_feed: iex
 
 watchlist:
+  # Pure semiconductor and semiconductor-adjacent hardware only.
+  # Large-cap tech (MSFT, GOOGL, AMZN, TSLA, META) were removed: they move on
+  # different macro drivers and dilute the sector signal.
   - NVDA
   - AMD
   - AVGO
@@ -25,16 +28,13 @@ watchlist:
   - SNDK
   - GLW
   - WDC
-  - MSFT
-  - GOOGL
-  - AMZN
-  - TSLA
-  - META
 
 strategy:
   # Buy when latest trade is this much above the previous daily close.
   buy_threshold_pct: 2.0
   # Sell an existing position when latest trade is this much below the previous daily close.
+  # Implicit R:R from entry: entering at +2% and exiting at -1% (relative to the same
+  # previous close) is a ~2.94% stop below the entry price — reasonable for semi stocks.
   sell_threshold_pct: -1.0
   per_trade_notional: 250.0
   max_position_notional: 1000.0
@@ -47,13 +47,18 @@ risk:
   dry_run: true
   require_market_open: true
   max_orders_per_run: 3
-  stop_loss_pct: 0.5
-  trailing_stop_pct: 25.0
+  # ML strategy fallback only — overridden by ml.stop_loss_pct below.
+  # The daily momentum strategy does NOT use this; it exits via strategy.sell_threshold_pct.
+  stop_loss_pct: 5.0
+  # ML strategy fallback only — overridden by ml.trailing_stop_pct below.
+  # Not used by the daily momentum or intraday strategies.
+  trailing_stop_pct: 10.0
   max_account_drawdown_pct: 15.0
   max_daily_loss_pct: 3.0
   flatten_on_daily_loss: true
   max_total_position_notional: 10000.0
-  take_profit_pct: 1.0
+  # ML strategy fallback only — overridden by ml.take_profit_pct below.
+  take_profit_pct: 3.0
   exit_before_close: "15:55"
 
 orders:
@@ -130,11 +135,16 @@ ml:
   # Label a row positive when the close after this many trading days is above target_return_pct.
   horizon_days: 3
   target_return_pct: 1.0
-  buy_probability: 0.50
+  # 0.50 is no filter for logistic regression — the model outputs ~0.5 for uncertain rows.
+  # 0.60 is a reasonable starting point; run optimize-ml-params to tune further.
+  buy_probability: 0.60
   sell_probability: 0.25
   # ML-specific risk/position overrides (tuned by parameter optimizer; override global risk/strategy sections).
   stop_loss_pct: 10.0
   trailing_stop_pct: 18.0
+  # Explicit take profit for the ML strategy. The 3-day prediction horizon needs room to work;
+  # 1% (the former global fallback) exits too early on semiconductor moves.
+  take_profit_pct: 3.0
   per_trade_notional: 100.0
   max_position_notional: 2000.0
   max_symbols_to_buy_per_run: 3
@@ -147,7 +157,7 @@ ml:
   optimizer_return_drawdown_penalty: 1.5
   optimizer_trade_penalty: 0.05
   optimizer_max_trials: 80
-  buy_probability_grid: [0.50, 0.55, 0.60, 0.65]
+  buy_probability_grid: [0.55, 0.60, 0.65, 0.70]
   sell_probability_grid: [0.25, 0.30, 0.35, 0.40]
   per_trade_notional_grid: [100.0, 250.0]
   max_position_notional_grid: [500.0, 1000.0, 2000.0]

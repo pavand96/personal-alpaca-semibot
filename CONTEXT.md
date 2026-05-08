@@ -279,21 +279,25 @@ ml:
   model_type: logistic_regression
   horizon_days: 3
   target_return_pct: 1.0
-  buy_probability: 0.50
+  buy_probability: 0.60       # 0.50 is no filter for logistic regression
   sell_probability: 0.25
   feature_lookback_days: 100
   # ML-specific risk overrides (tuned by optimizer):
   stop_loss_pct: 10.0
   trailing_stop_pct: 18.0
+  take_profit_pct: 3.0        # 3-day horizon needs room; 1% exits too early
   per_trade_notional: 100.0
   max_position_notional: 2000.0
   max_symbols_to_buy_per_run: 3
 
 risk:
-  stop_loss_pct: 0.5          # used by daily momentum bot only
-  trailing_stop_pct: 25.0
+  # These three are ML strategy fallbacks only — overridden by ml.* above.
+  # The daily momentum strategy does NOT use stop_loss_pct or take_profit_pct;
+  # it exits solely via strategy.sell_threshold_pct.
+  stop_loss_pct: 5.0
+  trailing_stop_pct: 10.0
+  take_profit_pct: 3.0
   max_account_drawdown_pct: 15.0
   max_daily_loss_pct: 3.0
-  take_profit_pct: 1.0
   max_orders_per_run: 3       # does NOT cap kill-switch flatten orders
 ```
