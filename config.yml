@@ -452,8 +452,8 @@ adaptive_semis_allocator:
   market_sma_days: 50
   min_market_momentum_pct: -2.0
   require_market_above_sma: true
-  momentum_lookback_days: 63
-  fast_momentum_days: 10
+  momentum_lookback_days: 126
+  fast_momentum_days: 21
   min_symbol_momentum_pct: 0.0
   min_trade_notional: 100.0
   retain_winners: true
