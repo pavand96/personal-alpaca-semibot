@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -93,27 +94,42 @@ def test_daily_loss_kill_switch_not_triggered_when_loss_below_threshold() -> Non
     assert bot.daily_loss_kill_switch_triggered() is False
 
 
-def test_daily_loss_kill_switch_flatten_bypasses_max_orders() -> None:
-    bot = make_bot_with_risk(max_daily_loss_pct=3.0, equity="9600", last_equity="10000")
-    bot.config["risk"]["flatten_on_daily_loss"] = True
-    # 5 positions but max_orders_per_run is only 1 — all 5 must still be sold
-    positions = {s: SimpleNamespace(symbol=s, qty="1.0") for s in ["NVDA", "AMD", "AVGO", "TSM", "INTC"]}
-
-    flatten_decisions = [
-        Decision(p.symbol, "sell", "daily loss kill switch", qty=float(p.qty))
-        for p in positions.values()
-        if float(p.qty) > 0
+def test_daily_loss_kill_switch_flatten_bypasses_max_orders(tmp_path) -> None:
+    bot = SemiMomentumBot.__new__(SemiMomentumBot)
+    bot.config = {
+        "risk": {
+            "dry_run": True,
+            "require_market_open": False,
+            "max_orders_per_run": 1,
+            "max_daily_loss_pct": 3.0,
+            "flatten_on_daily_loss": True,
+        },
+        "strategy": {
+            "buy_threshold_pct": 2.0,
+            "sell_threshold_pct": -1.0,
+            "per_trade_notional": 100.0,
+            "max_position_notional": 500.0,
+            "max_symbols_to_buy_per_run": 5,
+            "min_price": 1.0,
+            "max_price": 10000.0,
+        },
+        "orders": {"type": "market", "limit_price_offset_bps": 10.0},
+        "runtime": {"log_file": str(tmp_path / "events.csv")},
+    }
+    bot.trading = MagicMock(unsafe=True)
+    bot.trading.get_account.return_value = SimpleNamespace(
+        equity="9600", last_equity="10000", trading_blocked=False, account_blocked=False
+    )
+    bot.trading.get_clock.return_value = SimpleNamespace(is_open=True)
+    bot.trading.get_all_positions.return_value = [
+        SimpleNamespace(symbol=s, qty="1.0")
+        for s in ["NVDA", "AMD", "AVGO", "TSM", "INTC"]
     ]
-    # simulate the is_flatten bypass: max_orders does not cap the loop
-    max_orders = 1
-    submitted = []
-    is_flatten = True
-    for d in flatten_decisions:
-        if not is_flatten and len(submitted) >= max_orders:
-            break
-        submitted.append(d)
 
-    assert len(submitted) == 5
+    result = bot.trade_once()
+
+    assert len(result) == 5
+    assert all(d.action == "sell" for d in result)
 
 
 def test_daily_loss_kill_switch_flatten_decisions() -> None:
