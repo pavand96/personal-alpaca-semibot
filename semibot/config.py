@@ -288,6 +288,9 @@ def validate_config(config: dict[str, Any]) -> None:
             if not 0.0 <= val <= 1.0:
                 raise ValueError(f"ml.{key} must be between 0 and 1, got {val}")
     if "buy_probability" in ml and "sell_probability" in ml:
+        # Equal is intentionally allowed: it creates a single-threshold mode where the bot buys
+        # when flat (probability >= threshold) and sells when held (probability <= threshold).
+        # The held/not-held guard makes the two branches mutually exclusive within one run.
         if float(ml["buy_probability"]) < float(ml["sell_probability"]):
             raise ValueError(
                 "ml.buy_probability must be >= ml.sell_probability "

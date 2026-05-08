@@ -131,3 +131,7 @@ For each symbol:
 - Respect `strategy.max_position_notional`, `strategy.max_symbols_to_buy_per_run`, and `risk.max_orders_per_run`.
 
 Tune the watchlist and thresholds in `config.yml`.
+
+### Sell-only mode
+
+Setting `strategy.max_symbols_to_buy_per_run: 0` (or `ml.max_symbols_to_buy_per_run: 0` for the ML strategy) puts the bot into sell-only mode. No new positions are opened, but all exit logic continues to run: stop loss, trailing stop, take profit, exit-before-close, and the daily-loss kill-switch flatten. This is useful for an orderly wind-down without modifying any other config values.

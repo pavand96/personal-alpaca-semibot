@@ -155,6 +155,24 @@ ml:
         load_config(config_path)
 
 
+def test_load_config_accepts_buy_probability_equal_to_sell_probability(tmp_path) -> None:
+    # Equal values create a single-threshold mode: buy when flat, sell when held.
+    # The two conditions are mutually exclusive within one run (held vs not-held guard).
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        """
+ml:
+  buy_probability: 0.50
+  sell_probability: 0.50
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+    assert config["ml"]["buy_probability"] == 0.50
+    assert config["ml"]["sell_probability"] == 0.50
+
+
 def test_load_config_accepts_max_symbols_to_buy_per_run_zero(tmp_path) -> None:
     # 0 means sell-only mode: existing positions can be sold, no new buys
     config_path = tmp_path / "config.yml"

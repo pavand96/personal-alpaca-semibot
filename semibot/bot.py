@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
@@ -270,7 +270,7 @@ class SemiMomentumBot:
         append_event(
             self.config["runtime"]["log_file"],
             {
-                "timestamp": datetime.utcnow().isoformat(timespec="seconds"),
+                "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 "event": event,
                 "symbol": decision.symbol,
                 "action": decision.action,

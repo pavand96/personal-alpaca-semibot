@@ -187,8 +187,11 @@ def test_trade_once_hold_decisions_do_not_count_toward_max_orders() -> None:
 # Kill-switch paths
 # ---------------------------------------------------------------------------
 
-def test_trade_once_kill_switch_flattens_all_positions_bypassing_max_orders() -> None:
+def test_trade_once_kill_switch_flattens_all_positions_bypassing_max_orders(tmp_path) -> None:
+    # Calls trade_once() without mocking log_decision — exercises the full code path including
+    # CSV event logging. tmp_path provides a real writable directory for the log file.
     bot = make_bot(risk={"max_daily_loss_pct": 3.0, "max_orders_per_run": 1, "flatten_on_daily_loss": True})
+    bot.config["runtime"] = {"log_file": str(tmp_path / "events.csv")}
     bot.trading.get_account.return_value = SimpleNamespace(
         equity="9400", last_equity="10000", trading_blocked=False, account_blocked=False
     )
@@ -198,13 +201,15 @@ def test_trade_once_kill_switch_flattens_all_positions_bypassing_max_orders() ->
     ]
     bot.trading.get_all_positions.return_value = held
 
-    with patch.object(bot, "log_decision"):
-        result = bot.trade_once()
+    result = bot.trade_once()
 
     # all 5 positions sold even though max_orders_per_run=1
     assert len(result) == 5
     assert all(d.action == "sell" for d in result)
     assert all("kill switch" in d.reason for d in result)
+    # log file was actually written — one header row + one row per decision
+    log_lines = (tmp_path / "events.csv").read_text().splitlines()
+    assert len(log_lines) == 6  # header + 5 rows
 
 
 def test_trade_once_kill_switch_with_flatten_false_returns_empty() -> None:
