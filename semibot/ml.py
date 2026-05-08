@@ -40,6 +40,7 @@ NUMERIC_FEATURES = [
     "return_5d",
     "return_10d",
     "return_20d",
+    "return_50d",
     "intraday_return",
     "overnight_return",
     "range_pct",
@@ -48,6 +49,7 @@ NUMERIC_FEATURES = [
     "close_to_sma_5",
     "close_to_sma_10",
     "close_to_sma_20",
+    "close_to_sma_50",
     "volume_ratio_5d",
     "volume_change_1d",
 ]
@@ -188,19 +190,20 @@ class MLStrategy:
         bars_by_date = index_bars_by_date(bars_by_symbol)
 
         max_orders = int(self.config["risk"]["max_orders_per_run"])
-        max_buys = int(self.config["strategy"]["max_symbols_to_buy_per_run"])
-        per_trade_notional = float(self.config["strategy"]["per_trade_notional"])
-        max_position_notional = float(self.config["strategy"]["max_position_notional"])
+        max_buys = int(ml_settings.get("max_symbols_to_buy_per_run", self.config["strategy"]["max_symbols_to_buy_per_run"]))
+        per_trade_notional = float(ml_settings.get("per_trade_notional", self.config["strategy"]["per_trade_notional"]))
+        max_position_notional = float(ml_settings.get("max_position_notional", self.config["strategy"]["max_position_notional"]))
         min_price = float(self.config["strategy"]["min_price"])
         max_price = float(self.config["strategy"]["max_price"])
         buy_probability = float(ml_settings["buy_probability"])
         sell_probability = float(ml_settings["sell_probability"])
         slippage_bps = float(settings["slippage_bps"])
-        stop_loss_pct = float(self.config["risk"]["stop_loss_pct"])
-        trailing_stop_pct = float(self.config["risk"]["trailing_stop_pct"])
+        stop_loss_pct = float(ml_settings.get("stop_loss_pct", self.config["risk"]["stop_loss_pct"]))
+        trailing_stop_pct = float(ml_settings.get("trailing_stop_pct", self.config["risk"]["trailing_stop_pct"]))
         max_account_drawdown_pct = float(self.config["risk"]["max_account_drawdown_pct"])
 
         peak_equity = starting_cash
+        kill_switch_peak = starting_cash
         max_drawdown_pct = 0.0
         pending_signals: list[dict[str, Any]] = []
 
@@ -236,7 +239,10 @@ class MLStrategy:
             if peak_equity > 0:
                 drawdown_pct = ((equity - peak_equity) / peak_equity) * 100
                 max_drawdown_pct = min(max_drawdown_pct, drawdown_pct)
-            account_drawdown_pct = abs(min(0.0, ((equity - peak_equity) / peak_equity) * 100)) if peak_equity else 0.0
+            # kill_switch_peak resets when fully in cash so the bot can re-enter after a forced pause.
+            any_held = any(pos.qty > 0 for pos in positions.values())
+            kill_switch_peak = max(kill_switch_peak, equity) if any_held else equity
+            account_drawdown_pct = abs(min(0.0, ((equity - kill_switch_peak) / kill_switch_peak) * 100)) if kill_switch_peak else 0.0
 
             update_position_peaks(positions, today_bars)
             risk_signals = risk_exit_signals(
@@ -384,11 +390,11 @@ class MLStrategy:
             trial_config = deepcopy(self.config)
             trial_config["ml"]["buy_probability"] = float(buy_probability)
             trial_config["ml"]["sell_probability"] = float(sell_probability)
-            trial_config["strategy"]["per_trade_notional"] = float(per_trade_notional)
-            trial_config["strategy"]["max_position_notional"] = float(max_position_notional)
-            trial_config["strategy"]["max_symbols_to_buy_per_run"] = int(max_symbols_to_buy_per_run)
-            trial_config["risk"]["stop_loss_pct"] = float(stop_loss_pct)
-            trial_config["risk"]["trailing_stop_pct"] = float(trailing_stop_pct)
+            trial_config["ml"]["per_trade_notional"] = float(per_trade_notional)
+            trial_config["ml"]["max_position_notional"] = float(max_position_notional)
+            trial_config["ml"]["max_symbols_to_buy_per_run"] = int(max_symbols_to_buy_per_run)
+            trial_config["ml"]["stop_loss_pct"] = float(stop_loss_pct)
+            trial_config["ml"]["trailing_stop_pct"] = float(trailing_stop_pct)
 
             result = MLStrategy(trial_config, api_key=self.api_key, secret_key=self.secret_key).ml_backtest(
                 start=start,
@@ -909,6 +915,7 @@ def build_feature_row(symbol: str, bars: list[DailyBar], index: int) -> dict[str
         "return_5d": simple_return(5),
         "return_10d": simple_return(10),
         "return_20d": simple_return(20),
+        "return_50d": simple_return(50) if len(closes) > 50 else 0.0,
         "intraday_return": (current.close / current.open - 1) if current.open else 0.0,
         "overnight_return": (current.open / bars[index - 1].close - 1) if bars[index - 1].close else 0.0,
         "range_pct": ((current.high - current.low) / current.close) if current.close else 0.0,
@@ -917,6 +924,7 @@ def build_feature_row(symbol: str, bars: list[DailyBar], index: int) -> dict[str
         "close_to_sma_5": close_to_sma(5),
         "close_to_sma_10": close_to_sma(10),
         "close_to_sma_20": close_to_sma(20),
+        "close_to_sma_50": close_to_sma(50) if len(closes) > 50 else 0.0,
         "volume_ratio_5d": (current.volume / volume_mean_5 - 1) if volume_mean_5 else 0.0,
         "volume_change_1d": (current.volume / previous_volume - 1) if previous_volume else 0.0,
     }

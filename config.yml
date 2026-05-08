@@ -132,7 +132,13 @@ ml:
   target_return_pct: 1.0
   buy_probability: 0.50
   sell_probability: 0.25
-  feature_lookback_days: 30
+  # ML-specific risk/position overrides (tuned by parameter optimizer; override global risk/strategy sections).
+  stop_loss_pct: 10.0
+  trailing_stop_pct: 18.0
+  per_trade_notional: 100.0
+  max_position_notional: 2000.0
+  max_symbols_to_buy_per_run: 3
+  feature_lookback_days: 100
   validation_splits: 5
   validation_gap_days: 1
   random_state: 42
