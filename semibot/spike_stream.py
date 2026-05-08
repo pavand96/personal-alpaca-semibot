@@ -38,9 +38,9 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.live import NewsDataStream, StockDataStream
 from alpaca.data.requests import StockSnapshotRequest
 
+from semibot import ledger as _ledger
 from semibot.bot import SemiMomentumBot, floor_order_qty, limit_price_for_side
 from semibot.events import append_event
-from semibot import ledger as _ledger
 from semibot.spike_tracker import record_spike_entry
 
 log = logging.getLogger(__name__)
@@ -184,6 +184,35 @@ def _liquidity_ok(snap: Any, min_dollar_vol: float, min_trades: int) -> tuple[bo
     return True, ""
 
 
+def _liquidity_stats(snap: Any, price: float | None = None) -> tuple[float, int]:
+    """Return approximate session dollar volume and trade count from a snapshot."""
+    if not snap:
+        return 0.0, 0
+    daily = getattr(snap, "daily_bar", None)
+    if not daily:
+        return 0.0, 0
+
+    trade_count = int(getattr(daily, "trade_count", 0) or 0)
+    volume = float(getattr(daily, "volume", 0) or 0)
+    mark = float(price or 0)
+    if mark <= 0:
+        latest = getattr(snap, "latest_trade", None)
+        if latest:
+            mark = float(getattr(latest, "price", 0) or 0)
+    if mark <= 0:
+        quote = getattr(snap, "latest_quote", None)
+        if quote:
+            ask = float(getattr(quote, "ask_price", 0) or 0)
+            bid = float(getattr(quote, "bid_price", 0) or 0)
+            if ask > 0 and bid > 0:
+                mark = (ask + bid) / 2.0
+    return (volume * mark if mark > 0 else 0.0), trade_count
+
+
+def _fmt_money(value: float) -> str:
+    return f"${value:,.0f}"
+
+
 def _parse_feed(config: dict[str, Any]) -> DataFeed:
     raw = config["alpaca"].get("data_feed", "iex").upper()
     return DataFeed[raw] if raw in DataFeed.__members__ else DataFeed.IEX
@@ -279,6 +308,9 @@ class SpikeStreamScanner:
         # Only liquid names get the earnings-based sector-confirm timeout flush.
         self._pending_liquid: dict[str, tuple[float, float]] = {}  # symbol → (gap_pct, price)
         self._pending_spec: dict[str, tuple[float, float]] = {}
+        self._pending_details: dict[str, dict[str, Any]] = {}
+        self._order_details: dict[str, dict[str, Any]] = {}
+        self._decision_seen: set[tuple[str, str, str, str]] = set()
         self._pending_ts: dict[str, float] = {}                    # symbol → monotonic entry time
         self._order_lock = threading.Lock()
         self._earnings_symbols: set[str] = set()
@@ -299,7 +331,7 @@ class SpikeStreamScanner:
 
     def load_earnings_calendar(self) -> None:
         """Fetch today's earnings reporters — enables sell-on-miss in addition to buy-on-beat."""
-        from semibot.earnings_calendar import get_reporting_today, get_reporting_soon
+        from semibot.earnings_calendar import get_reporting_soon, get_reporting_today
 
         lookahead = int(self._settings.get("earnings_lookahead_days", 7))
         symbols = self.config["watchlist"]
@@ -310,9 +342,9 @@ class SpikeStreamScanner:
         soon = get_reporting_soon(symbols, days=lookahead)
         if today_reporters:
             print(f"  *** EARNINGS TODAY (bidirectional): {', '.join(sorted(today_reporters))} ***")
-            print(f"      Beat → buy immediately | Miss → sell position immediately")
+            print("      Beat → buy immediately | Miss → sell position immediately")
         elif soon:
-            print(f"  Upcoming earnings: " + "  ".join(f"{s}:{d}" for s, d in sorted(soon.items(), key=lambda x: x[1])))
+            print("  Upcoming earnings: " + "  ".join(f"{s}:{d}" for s, d in sorted(soon.items(), key=lambda x: x[1])))
         else:
             print(f"  No earnings in next {lookahead} days")
 
@@ -371,6 +403,107 @@ class SpikeStreamScanner:
             log.warning("Could not fetch positions: %s", exc)
         return self._held_cache
 
+    def _bucket(self, symbol: str) -> str:
+        return "speculative" if symbol in self._spec_symbols else "liquid_semi"
+
+    def _quality_details(
+        self,
+        symbol: str,
+        *,
+        gap_pct: float | None = None,
+        spread_pct: float | None = None,
+        max_spread_pct: float | None = None,
+        dollar_volume: float | None = None,
+        min_dollar_volume: float | None = None,
+        trade_count: int | None = None,
+        min_trade_count: int | None = None,
+        single_trade_value: float | None = None,
+        min_single_trade_value: float | None = None,
+        source: str | None = None,
+    ) -> dict[str, Any]:
+        details: dict[str, Any] = {"bucket": self._bucket(symbol)}
+        if source:
+            details["source"] = source
+        if gap_pct is not None:
+            details["gap"] = f"{gap_pct:+.2f}%"
+            details["_gap_pct"] = gap_pct
+        if spread_pct is not None and max_spread_pct is not None:
+            suffix = "OK" if spread_pct <= max_spread_pct else f"> max {max_spread_pct:.2f}%"
+            details["spread"] = f"{spread_pct:.2f}% {suffix}"
+            details["_spread_pct"] = spread_pct
+            details["_max_spread_pct"] = max_spread_pct
+        if dollar_volume is not None and min_dollar_volume is not None:
+            suffix = "OK" if dollar_volume >= min_dollar_volume or trade_count == 0 else f"< min {_fmt_money(min_dollar_volume)}"
+            details["dollar volume"] = f"{_fmt_money(dollar_volume)} {suffix}"
+            details["_dollar_volume"] = dollar_volume
+            details["_min_dollar_volume"] = min_dollar_volume
+        if trade_count is not None and min_trade_count is not None:
+            suffix = "OK" if trade_count >= min_trade_count or trade_count == 0 else f"< min {min_trade_count}"
+            details["trade count"] = f"{trade_count} {suffix}"
+            details["_trade_count"] = trade_count
+            details["_min_trade_count"] = min_trade_count
+        if single_trade_value is not None:
+            if min_single_trade_value is not None:
+                suffix = "OK" if single_trade_value >= min_single_trade_value else f"< min {_fmt_money(min_single_trade_value)}"
+                details["single trade value"] = f"{_fmt_money(single_trade_value)} {suffix}"
+            else:
+                details["single trade value"] = _fmt_money(single_trade_value)
+            details["_single_trade_value"] = single_trade_value
+        return details
+
+    def _print_decision(
+        self,
+        symbol: str,
+        action: str,
+        details: dict[str, Any],
+        *,
+        dedupe: bool = False,
+    ) -> None:
+        reason = str(details.get("reason", ""))
+        source = str(details.get("source", ""))
+        if dedupe:
+            key = (source, symbol, action, reason)
+            if key in self._decision_seen:
+                return
+            self._decision_seen.add(key)
+
+        ts = datetime.now(MARKET_TZ).strftime("%H:%M:%S")
+        display = [
+            f"{key}: {value}"
+            for key, value in details.items()
+            if not key.startswith("_") and value not in (None, "")
+        ]
+        print(f"[{ts}] {symbol} {action}  " + "  ".join(display))
+
+        try:
+            append_event(self.config["runtime"]["log_file"], {
+                "event": "spike_decision",
+                "symbol": symbol,
+                "action": action.lower(),
+                "decision": action,
+                "source": details.get("source", ""),
+                "bucket": details.get("bucket", ""),
+                "reason": details.get("reason", ""),
+                "skip_reason": details.get("reason", "") if action == "SKIPPED" else "",
+                "gap_pct": details.get("_gap_pct", ""),
+                "spread_pct": details.get("_spread_pct", ""),
+                "max_spread_pct": details.get("_max_spread_pct", ""),
+                "dollar_volume": details.get("_dollar_volume", ""),
+                "min_dollar_volume": details.get("_min_dollar_volume", ""),
+                "trade_count": details.get("_trade_count", ""),
+                "min_trade_count": details.get("_min_trade_count", ""),
+                "single_trade_value": details.get("_single_trade_value", ""),
+                "confirmation_count": details.get("_confirmation_count", ""),
+                "confirmation_required": details.get("_confirmation_required", ""),
+                "limit_price": details.get("_limit_price", ""),
+                "qty": details.get("_qty", ""),
+                "notional": details.get("_notional", ""),
+                "strategy": details.get("strategy", ""),
+                "price": details.get("_price", ""),
+            })
+        except Exception as exc:
+            log.warning("Could not append spike decision event: %s", exc)
+
     def _place_order(self, symbol: str, gap_pct: float, current_price: float) -> None:
         """Place an extended-hours limit order.  Safe to call from any thread."""
         from uuid import uuid4
@@ -395,9 +528,22 @@ class SpikeStreamScanner:
             parts.append("spec_bucket")
         reason = " ".join(parts)
         strategy = "spike_spec" if is_spec else "spike_liquid"
+        details = self._order_details.pop(symbol, self._quality_details(symbol, gap_pct=gap_pct))
+        details.update({
+            "limit price": f"${limit_price:.2f}",
+            "qty": f"{qty:.4f}",
+            "notional": f"${notional:.2f}",
+            "strategy": strategy,
+            "mode": "DRY-RUN" if self._dry_run else "PAPER",
+            "reason": details.get("reason", "confirmed spike"),
+            "_limit_price": limit_price,
+            "_qty": qty,
+            "_notional": notional,
+            "_price": current_price,
+        })
 
         if self._dry_run:
-            print(f"  DRY-RUN  BUY {symbol}  {qty:.4f}sh @ ${limit_price:.2f}  [{reason}]")
+            self._print_decision(symbol, "ORDER", details)
             _ledger.record_fill(
                 self._ledger_db, symbol, "buy", qty, limit_price, notional,
                 reason, strategy=strategy, dry_run=True,
@@ -415,7 +561,8 @@ class SpikeStreamScanner:
         )
         result = bot.trading.submit_order(order_data=order)
         order_id = str(result.id)  # type: ignore[union-attr]
-        print(f"  ORDER    BUY {symbol}  {qty:.4f}sh @ ${limit_price:.2f}  [{reason}]  id={order_id}")
+        details["order id"] = order_id
+        self._print_decision(symbol, "ORDER", details)
         try:
             record_spike_entry(self._tracker_path, symbol, gap_pct, current_price)
         except Exception as exc:
@@ -449,17 +596,38 @@ class SpikeStreamScanner:
         position = positions.get(symbol)
         if not position:
             log.warning("_place_sell_order: no position found for %s", symbol)
+            self._print_decision(symbol, "SKIPPED", {
+                **self._quality_details(symbol, gap_pct=gap_pct),
+                "reason": "earnings miss sell skipped; no position found",
+            })
             return
         qty = float(getattr(position, "qty", 0.0))
         if qty <= 0:
+            self._print_decision(symbol, "SKIPPED", {
+                **self._quality_details(symbol, gap_pct=gap_pct),
+                "reason": "earnings miss sell skipped; zero position quantity",
+            })
             return
 
         limit_price = limit_price_for_side(current_price, "sell", self._offset_bps)
         reason = f"earnings_miss gap={gap_pct:+.1f}%"
         notional_sell = qty * limit_price
+        details = self._quality_details(symbol, gap_pct=gap_pct)
+        details.update({
+            "limit price": f"${limit_price:.2f}",
+            "qty": f"{qty:.4f}",
+            "notional": f"${notional_sell:.2f}",
+            "strategy": "spike_sell",
+            "mode": "DRY-RUN" if self._dry_run else "PAPER",
+            "reason": "earnings miss sell triggered",
+            "_limit_price": limit_price,
+            "_qty": qty,
+            "_notional": notional_sell,
+            "_price": current_price,
+        })
 
         if self._dry_run:
-            print(f"  DRY-RUN  SELL {symbol}  {qty:.4f}sh @ ${limit_price:.2f}  [{reason}]")
+            self._print_decision(symbol, "SELL", details)
             _ledger.record_fill(
                 self._ledger_db, symbol, "sell", qty, limit_price, notional_sell,
                 reason, strategy="spike_sell", dry_run=True,
@@ -477,7 +645,8 @@ class SpikeStreamScanner:
         )
         result = bot.trading.submit_order(order_data=order)
         order_id = str(result.id)  # type: ignore[union-attr]
-        print(f"  SELL     {symbol}  {qty:.4f}sh @ ${limit_price:.2f}  [{reason}]  id={order_id}")
+        details["order id"] = order_id
+        self._print_decision(symbol, "SELL", details)
         try:
             from semibot.spike_tracker import remove_spike_entry
             remove_spike_entry(self._tracker_path, symbol)
@@ -518,11 +687,13 @@ class SpikeStreamScanner:
                 return False
             held = self._get_held_symbols()
             if symbol not in held:
+                self._print_decision(symbol, "SKIPPED", {
+                    **self._quality_details(symbol, gap_pct=gap_pct, source=source),
+                    "reason": "earnings miss detected but no position is open",
+                }, dedupe=True)
                 return False
             self._already_sold.add(symbol)
 
-        ts = datetime.now(MARKET_TZ).strftime("%H:%M:%S")
-        print(f"[{ts}] *** EARNINGS MISS {symbol} [{source}]: {gap_pct:+.2f}% → SELLING position ***")
         self._place_sell_order(symbol, gap_pct, price)
         return True
 
@@ -534,6 +705,7 @@ class SpikeStreamScanner:
         source: str,
         pending: dict[str, tuple[float, float]] | None = None,
         confirm: int | None = None,
+        details: dict[str, Any] | None = None,
     ) -> list[tuple[str, float, float]]:
         """Thread-safe: add symbol to pending; return list of (sym, gap, price) to order if threshold met.
 
@@ -545,15 +717,32 @@ class SpikeStreamScanner:
         if confirm is None:
             confirm = self._sector_confirm
         pending[symbol] = (gap_pct, price)
+        decision_details = dict(details or self._quality_details(symbol, gap_pct=gap_pct))
         self._pending_ts[symbol] = time.monotonic()
-        ts = datetime.now(MARKET_TZ).strftime("%H:%M:%S")
         n = len(pending)
-        print(f"[{ts}] {source} PENDING {symbol}: {gap_pct:+.2f}%  [{n}/{confirm} for confirm]")
+        decision_details.update({
+            "source": source,
+            "confirmation": f"{n}/{confirm} sector names gapping",
+            "reason": "waiting for sector/spec bucket confirmation",
+            "_confirmation_count": n,
+            "_confirmation_required": confirm,
+            "_price": price,
+        })
+        self._pending_details[symbol] = decision_details
+        self._print_decision(symbol, "PENDING", decision_details)
         if n >= confirm:
             to_flush = list(pending.items())
             for sym, _ in to_flush:
                 self._already_ordered.add(sym)
                 self._pending_ts.pop(sym, None)
+                order_details = dict(self._pending_details.pop(sym, {}))
+                order_details.update({
+                    "sector confirmation": f"{n}/{confirm} passed",
+                    "reason": "confirmed spec spike" if sym in self._spec_symbols else "confirmed semi spike",
+                    "_confirmation_count": n,
+                    "_confirmation_required": confirm,
+                })
+                self._order_details[sym] = order_details
             pending.clear()
             return [(sym, g, p) for sym, (g, p) in to_flush]
         return []
@@ -586,7 +775,7 @@ class SpikeStreamScanner:
         # Build price map first (no lock needed).
         # _best_price_from_snap falls back to NBBO midpoint when latest_trade is stale,
         # so we can detect gaps even if no pre-market trade has printed yet.
-        sym_data: list[tuple[str, float, float]] = []
+        sym_data: list[tuple[str, float, float, dict[str, Any]]] = []
         for symbol in all_symbols:
             is_spec = symbol in self._spec_symbols
             max_spread = self._spec_max_spread if is_spec else self._max_spread_pct
@@ -597,31 +786,50 @@ class SpikeStreamScanner:
             price = _best_price_from_snap(snap)
             if price is None:
                 continue
-            spread_pass, spread = _spread_ok(snap, max_spread)
-            if not spread_pass:
-                print(f"  {symbol}: spread {spread:.2f}% > {max_spread:.1f}% — skipping")
-                continue
-            liq_pass, liq_reason = _liquidity_ok(snap, min_dollar_vol, min_trades)
-            if not liq_pass:
-                print(f"  {symbol}: thin market ({liq_reason}) — skipping")
-                continue
             ref = self._reference_closes.get(symbol)
             if not ref or ref <= 0:
                 continue
             gap_pct = ((price / ref) - 1) * 100
-            sym_data.append((symbol, gap_pct, price))
+            spread_pass, spread = _spread_ok(snap, max_spread)
+            dollar_volume, trade_count = _liquidity_stats(snap, price)
+            details = self._quality_details(
+                symbol,
+                gap_pct=gap_pct,
+                spread_pct=spread,
+                max_spread_pct=max_spread,
+                dollar_volume=dollar_volume,
+                min_dollar_volume=min_dollar_vol,
+                trade_count=trade_count,
+                min_trade_count=min_trades,
+                source="STARTUP",
+            )
+            if not spread_pass:
+                self._print_decision(symbol, "SKIPPED", {
+                    **details,
+                    "reason": "spread too wide",
+                }, dedupe=True)
+                continue
+            liq_pass, liq_reason = _liquidity_ok(snap, min_dollar_vol, min_trades)
+            if not liq_pass:
+                self._print_decision(symbol, "SKIPPED", {
+                    **details,
+                    "liquidity": liq_reason,
+                    "reason": "thin pre-market liquidity",
+                }, dedupe=True)
+                continue
+            sym_data.append((symbol, gap_pct, price, details))
 
         # Check earnings misses outside the lock — _check_earnings_miss acquires its own
         # lock internally, so calling it inside _order_lock would deadlock.
         # Spec names skip earnings-miss logic — no position to sell, no calendar bypass.
         sold_symbols: set[str] = set()
-        for symbol, gap_pct, price in sym_data:
+        for symbol, gap_pct, price, _details in sym_data:
             if symbol not in self._spec_symbols:
                 if self._check_earnings_miss(symbol, gap_pct, price, "STARTUP"):
                     sold_symbols.add(symbol)
 
         with self._order_lock:
-            for symbol, gap_pct, price in sym_data:
+            for symbol, gap_pct, price, details in sym_data:
                 if symbol in sold_symbols:
                     continue
                 is_spec = symbol in self._spec_symbols
@@ -633,9 +841,22 @@ class SpikeStreamScanner:
                     continue
                 if gap_pct < min_gap or gap_pct > max_gap:
                     if abs(gap_pct) >= 1.0:
-                        print(f"  {symbol}: {gap_pct:+.2f}% (below threshold)")
+                        reason = "gap below threshold" if gap_pct < min_gap else "gap above max threshold"
+                        self._print_decision(symbol, "SKIPPED", {
+                            **self._quality_details(symbol, gap_pct=gap_pct, source="STARTUP"),
+                            "required gap": f"{min_gap:.2f}% to {max_gap:.2f}%",
+                            "reason": reason,
+                        }, dedupe=True)
                     continue
-                to_order.extend(self._try_queue_or_flush(symbol, gap_pct, price, "STARTUP", pending, confirm))
+                to_order.extend(self._try_queue_or_flush(
+                    symbol,
+                    gap_pct,
+                    price,
+                    "STARTUP",
+                    pending,
+                    confirm,
+                    details,
+                ))
 
         for sym, gap, price in to_order:
             self._place_order(sym, gap, price)
@@ -682,24 +903,48 @@ class SpikeStreamScanner:
             price = _best_price_from_snap(snap)
             if price is None:
                 continue
-            spread_pass, spread = _spread_ok(snap, max_spread)
-            if not spread_pass:
-                log.debug("%s: spread %.2f%% > %.1f%% — skipping", symbol, spread, max_spread)
-                continue
-            liq_pass, liq_reason = _liquidity_ok(snap, min_dollar_vol, min_trades)
-            if not liq_pass:
-                log.debug("%s: thin market (%s) — skipping", symbol, liq_reason)
-                continue
             ref = self._reference_closes.get(symbol)
             if not ref or ref <= 0:
                 continue
             gap_pct = ((price / ref) - 1) * 100
+            spread_pass, spread = _spread_ok(snap, max_spread)
+            dollar_volume, trade_count = _liquidity_stats(snap, price)
+            details = self._quality_details(
+                symbol,
+                gap_pct=gap_pct,
+                spread_pct=spread,
+                max_spread_pct=max_spread,
+                dollar_volume=dollar_volume,
+                min_dollar_volume=min_dollar_vol,
+                trade_count=trade_count,
+                min_trade_count=min_trades,
+                source="NEWS",
+            )
+            if not spread_pass:
+                self._print_decision(symbol, "SKIPPED", {
+                    **details,
+                    "reason": "spread too wide",
+                }, dedupe=True)
+                continue
+            liq_pass, liq_reason = _liquidity_ok(snap, min_dollar_vol, min_trades)
+            if not liq_pass:
+                self._print_decision(symbol, "SKIPPED", {
+                    **details,
+                    "liquidity": liq_reason,
+                    "reason": "thin pre-market liquidity",
+                }, dedupe=True)
+                continue
             if not is_spec and self._check_earnings_miss(symbol, gap_pct, price, "NEWS"):
                 continue
             if gap_pct < min_gap or gap_pct > max_gap:
+                reason = "gap below threshold" if gap_pct < min_gap else "gap above max threshold"
+                self._print_decision(symbol, "SKIPPED", {
+                    **details,
+                    "required gap": f"{min_gap:.2f}% to {max_gap:.2f}%",
+                    "reason": reason,
+                }, dedupe=True)
                 continue
 
-            ts = datetime.now(MARKET_TZ).strftime("%H:%M:%S")
             # Bypass sector confirmation only when the calendar confirms earnings today
             # AND the gap is large.  Spec names never get bypass — no calendar tracking.
             bypass = (
@@ -716,12 +961,25 @@ class SpikeStreamScanner:
                     self._already_ordered.add(symbol)
                     continue
                 if bypass:
-                    print(f"[{ts}] NEWS BYPASS {symbol}: {gap_pct:+.2f}% "
-                          f"(earnings today + gap ≥{self._earnings_bypass_gap:.0f}% → no sector confirm)")
                     self._already_ordered.add(symbol)
+                    self._order_details[symbol] = {
+                        **details,
+                        "sector confirmation": "earnings bypass",
+                        "reason": "earnings gap bypassed sector confirmation",
+                        "_confirmation_count": confirm,
+                        "_confirmation_required": confirm,
+                    }
                     to_order.append((symbol, gap_pct, price))
                 else:
-                    to_order.extend(self._try_queue_or_flush(symbol, gap_pct, price, "NEWS", pending, confirm))
+                    to_order.extend(self._try_queue_or_flush(
+                        symbol,
+                        gap_pct,
+                        price,
+                        "NEWS",
+                        pending,
+                        confirm,
+                        details,
+                    ))
 
             for sym, gap, p in to_order:
                 self._place_order(sym, gap, p)
@@ -770,7 +1028,18 @@ class SpikeStreamScanner:
 
         # Reject tiny prints — a 1-share test trade should not trigger an order
         trade_value = price * float(getattr(trade, "size", 0) or 0)
+        details = self._quality_details(
+            symbol,
+            gap_pct=gap_pct,
+            single_trade_value=trade_value,
+            min_single_trade_value=min_single,
+            source="TRADE",
+        )
         if trade_value < min_single:
+            self._print_decision(symbol, "SKIPPED", {
+                **details,
+                "reason": "single trade value too small",
+            }, dedupe=True)
             return
 
         # Check earnings miss (negative gap) before buy logic; spec names skip this
@@ -779,6 +1048,13 @@ class SpikeStreamScanner:
             return
 
         if gap_pct < min_gap or gap_pct > max_gap:
+            if abs(gap_pct) >= 1.0 or gap_pct > max_gap:
+                reason = "gap below threshold" if gap_pct < min_gap else "gap above max threshold"
+                self._print_decision(symbol, "SKIPPED", {
+                    **details,
+                    "required gap": f"{min_gap:.2f}% to {max_gap:.2f}%",
+                    "reason": reason,
+                }, dedupe=True)
             return
 
         if symbol in self._already_ordered:
@@ -794,7 +1070,7 @@ class SpikeStreamScanner:
             if symbol in held:
                 self._already_ordered.add(symbol)
                 return
-            to_order = self._try_queue_or_flush(symbol, gap_pct, price, "TRADE", pending, confirm)
+            to_order = self._try_queue_or_flush(symbol, gap_pct, price, "TRADE", pending, confirm, details)
 
         if to_order:
             loop = asyncio.get_running_loop()
@@ -826,9 +1102,14 @@ class SpikeStreamScanner:
                     self._pending_ts.pop(sym, None)
                     self._already_ordered.add(sym)
                     to_order.append((sym, gap_pct, price))
-                    ts = datetime.now(MARKET_TZ).strftime("%H:%M:%S")
-                    print(f"[{ts}] EARNINGS-FLUSH {sym}: {gap_pct:+.2f}% "
-                          f"(sector confirm timeout — ordering without full confirm)")
+                    details = dict(self._pending_details.pop(sym, {}))
+                    details.update({
+                        "sector confirmation": "earnings timeout bypass",
+                        "reason": "earnings pending timeout; ordering without full sector confirmation",
+                        "_confirmation_count": 1,
+                        "_confirmation_required": self._sector_confirm,
+                    })
+                    self._order_details[sym] = details
             for sym, gap, p in to_order:
                 self._place_order(sym, gap, p)
 
