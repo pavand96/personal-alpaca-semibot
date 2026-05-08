@@ -501,8 +501,12 @@ adaptive_semis_allocator:
   # After-hours: gap = (current price / today's 4pm close) - 1
   spike_min_gap_pct: 5.0          # enter if spike >= 5% (3-5% gaps are coin flip per backtest)
   spike_max_gap_pct: 20.0         # skip if spike > 20% (reversal risk)
-  spike_notional_per_trade: 1000.0  # notional per position — increase once validated
+  spike_notional_per_trade: 200.0   # paper baseline — raise after validation
   spike_sector_confirm: 3           # require 3+ watchlist symbols gapping before entering
+  spike_max_spread_pct: 2.0         # skip if bid-ask spread > 2% of mid (thin pre-market)
+  spike_min_dollar_volume: 50000    # skip if pre-market session dollar volume < $50K
+  spike_min_trade_count: 2          # skip if fewer than 2 distinct pre-market trades
+  spike_min_single_trade_value: 2000  # Layer 3: skip if triggering trade < $2K (1-share prints)
   spike_tracker_path: logs/spike_tracker.json  # tracks entries for 1-day hold exit
   earnings_notional_multiplier: 1.5  # boost notional 1.5× when earnings detected in news
   earnings_bypass_gap_pct: 8.0       # news-triggered gaps this large bypass sector confirmation
@@ -511,6 +515,18 @@ adaptive_semis_allocator:
   news_signal_ttl_hours: 20           # signals older than this are discarded (clears overnight by next close)
   earnings_lookahead_days: 7          # how far ahead to check earnings calendar
   spike_sell_gap_pct: 5.0             # sell existing position if earnings-day gap <= -5%
+  # ── Speculative bucket (QUBT, RGTI, IONQ, QBTS, ARQQ) ──────────────────────
+  # Low-float quantum/AI names with retail-driven momentum spikes.
+  # Stricter spread/volume requirements; no earnings bypass; smaller notional.
+  speculative_watchlist: [QUBT, RGTI, IONQ, QBTS, ARQQ]
+  spec_spike_min_gap_pct: 10.0          # higher bar — spec names spike harder or not at all
+  spec_spike_max_gap_pct: 60.0          # allow bigger moves (these can run 30-50% overnight)
+  spec_spike_notional: 50.0             # small size — high volatility, limited liquidity
+  spec_spike_max_spread_pct: 1.0        # tighter spread required (thin books = dangerous fills)
+  spec_spike_min_dollar_volume: 100000  # $100K pre-market floor (stricter than liquid semis)
+  spec_spike_min_trade_count: 5         # need more prints before trusting the gap
+  spec_spike_sector_confirm: 2          # only 2 spec names must gap together (smaller universe)
+  spec_spike_min_single_trade_value: 500  # lower floor — spec stocks trade smaller prints
   score_proportional_sizing: true
   bull_exposure_pct: 0.80
   bull_max_symbols: 5

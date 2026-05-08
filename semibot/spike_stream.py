@@ -114,12 +114,86 @@ def _best_price_from_snap(snap: Any) -> float | None:
     return None
 
 
+def _spread_ok(snap: Any, max_spread_pct: float) -> tuple[bool, float]:
+    """Check bid-ask spread from snapshot.
+
+    Returns (ok, spread_pct).  Fails open (True) when quote data is unavailable —
+    a missing quote just means we cannot verify, not that the market is bad.
+    Fails closed when one side of the book is missing (withdrawn quote = risk signal).
+    """
+    if not snap:
+        return True, 0.0
+    quote = getattr(snap, "latest_quote", None)
+    if not quote:
+        return True, 0.0
+    ask = float(getattr(quote, "ask_price", 0) or 0)
+    bid = float(getattr(quote, "bid_price", 0) or 0)
+    if ask <= 0 or bid <= 0:
+        # One side missing — can't assess; block it
+        return False, 0.0
+    mid = (ask + bid) / 2.0
+    if mid <= 0:
+        return True, 0.0
+    spread_pct = (ask - bid) / mid * 100.0
+    return spread_pct <= max_spread_pct, spread_pct
+
+
+def _liquidity_ok(snap: Any, min_dollar_vol: float, min_trades: int) -> tuple[bool, str]:
+    """Check pre-market session liquidity from snapshot daily_bar.
+
+    Fails open when no pre-market activity has accumulated yet — this is expected at
+    3:45 AM before the 4 AM open and should not block the startup scan.
+    Fails closed when some activity exists but is too thin to trust: a gap caused
+    by 1–2 trades or a $5K print is likely noise, not real demand.
+    Returns (ok, reason_if_rejected).
+    """
+    if not snap:
+        return True, ""
+    daily = getattr(snap, "daily_bar", None)
+    if not daily:
+        return True, ""
+
+    trade_count = int(getattr(daily, "trade_count", 0) or 0)
+    volume = float(getattr(daily, "volume", 0) or 0)
+
+    # No pre-market activity yet — fail open (pre-market may not have opened)
+    if trade_count == 0:
+        return True, ""
+
+    if trade_count < min_trades:
+        return False, f"trade_count={trade_count} < {min_trades}"
+
+    if min_dollar_vol > 0:
+        price = 0.0
+        lt = getattr(snap, "latest_trade", None)
+        if lt:
+            price = float(getattr(lt, "price", 0) or 0)
+        if price <= 0:
+            q = getattr(snap, "latest_quote", None)
+            if q:
+                ask = float(getattr(q, "ask_price", 0) or 0)
+                bid = float(getattr(q, "bid_price", 0) or 0)
+                if ask > 0 and bid > 0:
+                    price = (ask + bid) / 2.0
+        if price > 0:
+            dollar_vol = volume * price
+            if dollar_vol < min_dollar_vol:
+                return False, f"dollar_vol=${dollar_vol:,.0f} < ${min_dollar_vol:,.0f}"
+
+    return True, ""
+
+
 def _parse_feed(config: dict[str, Any]) -> DataFeed:
     raw = config["alpaca"].get("data_feed", "iex").upper()
     return DataFeed[raw] if raw in DataFeed.__members__ else DataFeed.IEX
 
 
-def fetch_reference_closes(config: dict[str, Any], api_key: str, secret_key: str) -> dict[str, float]:
+def fetch_reference_closes(
+    config: dict[str, Any],
+    api_key: str,
+    secret_key: str,
+    symbols: list[str] | None = None,
+) -> dict[str, float]:
     """Return the most recent regular-session close for each watchlist symbol.
 
     Pre-market  (before 16:00 ET): uses previous_daily_bar.close (yesterday's 4pm)
@@ -130,7 +204,8 @@ def fetch_reference_closes(config: dict[str, Any], api_key: str, secret_key: str
 
     client = StockHistoricalDataClient(api_key=api_key, secret_key=secret_key)
     feed = _parse_feed(config)
-    symbols = config["watchlist"]
+    if symbols is None:
+        symbols = config["watchlist"]
 
     snapshots = client.get_stock_snapshot(
         StockSnapshotRequest(symbol_or_symbols=symbols, feed=feed)
@@ -179,13 +254,31 @@ class SpikeStreamScanner:
         self._offset_bps = float(config.get("orders", {}).get("premarket_limit_offset_bps", 25.0))
 
         self._sell_gap_threshold = float(self._settings.get("spike_sell_gap_pct", 5.0))
+        self._max_spread_pct = float(self._settings.get("spike_max_spread_pct", 2.0))
+        self._min_dollar_volume = float(self._settings.get("spike_min_dollar_volume", 50_000.0))
+        self._min_trade_count = int(self._settings.get("spike_min_trade_count", 2))
+        self._min_single_trade_value = float(self._settings.get("spike_min_single_trade_value", 2_000.0))
+
+        # Speculative bucket — separate thresholds, smaller notional, no earnings bypass
+        _s = self._settings
+        self._spec_symbols: frozenset[str] = frozenset(_s.get("speculative_watchlist", []))
+        self._spec_min_gap = float(_s.get("spec_spike_min_gap_pct", 10.0))
+        self._spec_max_gap = float(_s.get("spec_spike_max_gap_pct", 60.0))
+        self._spec_notional = float(_s.get("spec_spike_notional", 50.0))
+        self._spec_max_spread = float(_s.get("spec_spike_max_spread_pct", 1.0))
+        self._spec_min_dollar_vol = float(_s.get("spec_spike_min_dollar_volume", 100_000.0))
+        self._spec_min_trade_count = int(_s.get("spec_spike_min_trade_count", 5))
+        self._spec_sector_confirm = int(_s.get("spec_spike_sector_confirm", 2))
+        self._spec_min_single_trade_value = float(_s.get("spec_spike_min_single_trade_value", 500.0))
 
         self._reference_closes: dict[str, float] = {}
         self._already_ordered: set[str] = set()
         self._already_sold: set[str] = set()
-        # Qualified but waiting for sector_confirm threshold
-        self._pending: dict[str, tuple[float, float]] = {}  # symbol → (gap_pct, price)
-        self._pending_ts: dict[str, float] = {}             # symbol → monotonic time of entry
+        # Two pending queues — liquid semis and speculative names.
+        # Only liquid names get the earnings-based sector-confirm timeout flush.
+        self._pending_liquid: dict[str, tuple[float, float]] = {}  # symbol → (gap_pct, price)
+        self._pending_spec: dict[str, tuple[float, float]] = {}
+        self._pending_ts: dict[str, float] = {}                    # symbol → monotonic entry time
         self._order_lock = threading.Lock()
         self._earnings_symbols: set[str] = set()
         # Symbols with earnings TODAY — bidirectional (buy beat, sell miss)
@@ -195,7 +288,12 @@ class SpikeStreamScanner:
         self._held_cache_ts: float = 0.0
 
     def load_references(self) -> None:
-        self._reference_closes = fetch_reference_closes(self.config, self.api_key, self.secret_key)
+        liquid = self.config["watchlist"]
+        spec = list(self._spec_symbols)
+        combined = list(dict.fromkeys(liquid + spec))  # dedupe, preserve order
+        self._reference_closes = fetch_reference_closes(
+            self.config, self.api_key, self.secret_key, symbols=combined
+        )
 
     def load_earnings_calendar(self) -> None:
         """Fetch today's earnings reporters — enables sell-on-miss in addition to buy-on-beat."""
@@ -278,8 +376,9 @@ class SpikeStreamScanner:
         from alpaca.trading.enums import OrderSide, TimeInForce
         from alpaca.trading.requests import LimitOrderRequest
 
-        notional = self._notional
-        if self._earnings_multiplier > 1.0 and symbol in self._earnings_symbols:
+        is_spec = symbol in self._spec_symbols
+        notional = self._spec_notional if is_spec else self._notional
+        if not is_spec and self._earnings_multiplier > 1.0 and symbol in self._earnings_symbols:
             notional *= self._earnings_multiplier
             print(f"  [catalyst] {symbol}: notional boosted to ${notional:.0f} (×{self._earnings_multiplier:.1f})")
 
@@ -399,22 +498,35 @@ class SpikeStreamScanner:
         self._place_sell_order(symbol, gap_pct, price)
         return True
 
-    def _try_queue_or_flush(self, symbol: str, gap_pct: float, price: float, source: str) -> list[tuple[str, float, float]]:
+    def _try_queue_or_flush(
+        self,
+        symbol: str,
+        gap_pct: float,
+        price: float,
+        source: str,
+        pending: dict[str, tuple[float, float]] | None = None,
+        confirm: int | None = None,
+    ) -> list[tuple[str, float, float]]:
         """Thread-safe: add symbol to pending; return list of (sym, gap, price) to order if threshold met.
 
         Must be called with _order_lock held by the caller.
+        Pass pending=self._pending_spec and confirm=self._spec_sector_confirm for spec names.
         """
-        self._pending[symbol] = (gap_pct, price)
+        if pending is None:
+            pending = self._pending_liquid
+        if confirm is None:
+            confirm = self._sector_confirm
+        pending[symbol] = (gap_pct, price)
         self._pending_ts[symbol] = time.monotonic()
         ts = datetime.now(MARKET_TZ).strftime("%H:%M:%S")
-        n = len(self._pending)
-        print(f"[{ts}] {source} PENDING {symbol}: {gap_pct:+.2f}%  [{n}/{self._sector_confirm} for confirm]")
-        if n >= self._sector_confirm:
-            to_flush = list(self._pending.items())
+        n = len(pending)
+        print(f"[{ts}] {source} PENDING {symbol}: {gap_pct:+.2f}%  [{n}/{confirm} for confirm]")
+        if n >= confirm:
+            to_flush = list(pending.items())
             for sym, _ in to_flush:
                 self._already_ordered.add(sym)
-            self._pending.clear()
-            self._pending_ts.clear()
+                self._pending_ts.pop(sym, None)
+            pending.clear()
             return [(sym, g, p) for sym, (g, p) in to_flush]
         return []
 
@@ -424,12 +536,15 @@ class SpikeStreamScanner:
         """Snapshot all symbols right after subscription — catches pre-existing gaps."""
         if not self._reference_closes:
             return
+        liquid = self.config["watchlist"]
+        spec = list(self._spec_symbols)
+        all_symbols = list(dict.fromkeys(liquid + spec))
         print("Startup gap scan (checking symbols already moving)...")
         try:
             client = StockHistoricalDataClient(api_key=self.api_key, secret_key=self.secret_key)
             snapshots = client.get_stock_snapshot(
                 StockSnapshotRequest(
-                    symbol_or_symbols=self.config["watchlist"],
+                    symbol_or_symbols=all_symbols,
                     feed=_parse_feed(self.config),
                 )
             )
@@ -444,9 +559,23 @@ class SpikeStreamScanner:
         # _best_price_from_snap falls back to NBBO midpoint when latest_trade is stale,
         # so we can detect gaps even if no pre-market trade has printed yet.
         sym_data: list[tuple[str, float, float]] = []
-        for symbol in self.config["watchlist"]:
-            price = _best_price_from_snap(snapshots.get(symbol))
+        for symbol in all_symbols:
+            is_spec = symbol in self._spec_symbols
+            max_spread = self._spec_max_spread if is_spec else self._max_spread_pct
+            min_dollar_vol = self._spec_min_dollar_vol if is_spec else self._min_dollar_volume
+            min_trades = self._spec_min_trade_count if is_spec else self._min_trade_count
+
+            snap = snapshots.get(symbol)
+            price = _best_price_from_snap(snap)
             if price is None:
+                continue
+            spread_pass, spread = _spread_ok(snap, max_spread)
+            if not spread_pass:
+                print(f"  {symbol}: spread {spread:.2f}% > {max_spread:.1f}% — skipping")
+                continue
+            liq_pass, liq_reason = _liquidity_ok(snap, min_dollar_vol, min_trades)
+            if not liq_pass:
+                print(f"  {symbol}: thin market ({liq_reason}) — skipping")
                 continue
             ref = self._reference_closes.get(symbol)
             if not ref or ref <= 0:
@@ -456,27 +585,34 @@ class SpikeStreamScanner:
 
         # Check earnings misses outside the lock — _check_earnings_miss acquires its own
         # lock internally, so calling it inside _order_lock would deadlock.
+        # Spec names skip earnings-miss logic — no position to sell, no calendar bypass.
         sold_symbols: set[str] = set()
         for symbol, gap_pct, price in sym_data:
-            if self._check_earnings_miss(symbol, gap_pct, price, "STARTUP"):
-                sold_symbols.add(symbol)
+            if symbol not in self._spec_symbols:
+                if self._check_earnings_miss(symbol, gap_pct, price, "STARTUP"):
+                    sold_symbols.add(symbol)
 
         with self._order_lock:
             for symbol, gap_pct, price in sym_data:
                 if symbol in sold_symbols:
                     continue
-                if symbol in self._already_ordered or symbol in self._pending or symbol in held:
+                is_spec = symbol in self._spec_symbols
+                pending = self._pending_spec if is_spec else self._pending_liquid
+                min_gap = self._spec_min_gap if is_spec else self._min_gap
+                max_gap = self._spec_max_gap if is_spec else self._max_gap
+                confirm = self._spec_sector_confirm if is_spec else self._sector_confirm
+                if symbol in self._already_ordered or symbol in pending or symbol in held:
                     continue
-                if gap_pct < self._min_gap or gap_pct > self._max_gap:
+                if gap_pct < min_gap or gap_pct > max_gap:
                     if abs(gap_pct) >= 1.0:
                         print(f"  {symbol}: {gap_pct:+.2f}% (below threshold)")
                     continue
-                to_order.extend(self._try_queue_or_flush(symbol, gap_pct, price, "STARTUP"))
+                to_order.extend(self._try_queue_or_flush(symbol, gap_pct, price, "STARTUP", pending, confirm))
 
         for sym, gap, price in to_order:
             self._place_order(sym, gap, price)
 
-        if not to_order and not self._pending:
+        if not to_order and not self._pending_liquid and not self._pending_spec:
             print("  No pre-existing gaps above threshold")
 
     # ── Layer 2: news WebSocket ───────────────────────────────────────────────
@@ -505,28 +641,48 @@ class SpikeStreamScanner:
         for symbol in symbols:
             if symbol in self._already_ordered:
                 continue
-            price = _best_price_from_snap(snapshots.get(symbol))
+            is_spec = symbol in self._spec_symbols
+            max_spread = self._spec_max_spread if is_spec else self._max_spread_pct
+            min_dollar_vol = self._spec_min_dollar_vol if is_spec else self._min_dollar_volume
+            min_trades = self._spec_min_trade_count if is_spec else self._min_trade_count
+            min_gap = self._spec_min_gap if is_spec else self._min_gap
+            max_gap = self._spec_max_gap if is_spec else self._max_gap
+            pending = self._pending_spec if is_spec else self._pending_liquid
+            confirm = self._spec_sector_confirm if is_spec else self._sector_confirm
+
+            snap = snapshots.get(symbol)
+            price = _best_price_from_snap(snap)
             if price is None:
+                continue
+            spread_pass, spread = _spread_ok(snap, max_spread)
+            if not spread_pass:
+                log.debug("%s: spread %.2f%% > %.1f%% — skipping", symbol, spread, max_spread)
+                continue
+            liq_pass, liq_reason = _liquidity_ok(snap, min_dollar_vol, min_trades)
+            if not liq_pass:
+                log.debug("%s: thin market (%s) — skipping", symbol, liq_reason)
                 continue
             ref = self._reference_closes.get(symbol)
             if not ref or ref <= 0:
                 continue
             gap_pct = ((price / ref) - 1) * 100
-            # Check earnings miss before buy logic
-            if self._check_earnings_miss(symbol, gap_pct, price, "NEWS"):
+            if not is_spec and self._check_earnings_miss(symbol, gap_pct, price, "NEWS"):
                 continue
-            if gap_pct < self._min_gap or gap_pct > self._max_gap:
+            if gap_pct < min_gap or gap_pct > max_gap:
                 continue
 
             ts = datetime.now(MARKET_TZ).strftime("%H:%M:%S")
             # Bypass sector confirmation only when the calendar confirms earnings today
-            # AND the gap is large.  Headline keywords are NOT sufficient — a bullish
-            # headline can be fully priced in or misleading.
-            bypass = symbol in self._earnings_today and gap_pct >= self._earnings_bypass_gap
+            # AND the gap is large.  Spec names never get bypass — no calendar tracking.
+            bypass = (
+                not is_spec
+                and symbol in self._earnings_today
+                and gap_pct >= self._earnings_bypass_gap
+            )
             to_order: list[tuple[str, float, float]] = []
 
             with self._order_lock:
-                if symbol in self._already_ordered or symbol in self._pending:
+                if symbol in self._already_ordered or symbol in pending:
                     continue
                 if symbol in held:
                     self._already_ordered.add(symbol)
@@ -537,7 +693,7 @@ class SpikeStreamScanner:
                     self._already_ordered.add(symbol)
                     to_order.append((symbol, gap_pct, price))
                 else:
-                    to_order.extend(self._try_queue_or_flush(symbol, gap_pct, price, "NEWS"))
+                    to_order.extend(self._try_queue_or_flush(symbol, gap_pct, price, "NEWS", pending, confirm))
 
             for sym, gap, p in to_order:
                 self._place_order(sym, gap, p)
@@ -552,7 +708,7 @@ class SpikeStreamScanner:
         if not any(kw in text for kw in _CATALYST_KEYWORDS):
             return
 
-        watchlist_set = set(self.config["watchlist"])
+        watchlist_set = set(self.config["watchlist"]) | self._spec_symbols
         relevant = [s for s in symbols if s in watchlist_set]
         if not relevant:
             return
@@ -577,12 +733,24 @@ class SpikeStreamScanner:
         price = float(trade.price)
         gap_pct = ((price / ref) - 1) * 100
 
-        # Check earnings miss (negative gap) before buy logic
-        if self._check_earnings_miss(symbol, gap_pct, price, "TRADE"):
+        is_spec = symbol in self._spec_symbols
+        min_single = self._spec_min_single_trade_value if is_spec else self._min_single_trade_value
+        min_gap = self._spec_min_gap if is_spec else self._min_gap
+        max_gap = self._spec_max_gap if is_spec else self._max_gap
+        pending = self._pending_spec if is_spec else self._pending_liquid
+        confirm = self._spec_sector_confirm if is_spec else self._sector_confirm
+
+        # Reject tiny prints — a 1-share test trade should not trigger an order
+        trade_value = price * float(getattr(trade, "size", 0) or 0)
+        if trade_value < min_single:
+            return
+
+        # Check earnings miss (negative gap) before buy logic; spec names skip this
+        if not is_spec and self._check_earnings_miss(symbol, gap_pct, price, "TRADE"):
             await asyncio.sleep(0)  # yield to event loop
             return
 
-        if gap_pct < self._min_gap or gap_pct > self._max_gap:
+        if gap_pct < min_gap or gap_pct > max_gap:
             return
 
         if symbol in self._already_ordered:
@@ -593,12 +761,12 @@ class SpikeStreamScanner:
         held = self._get_held_symbols()
         to_order: list[tuple[str, float, float]] = []
         with self._order_lock:
-            if symbol in self._already_ordered or symbol in self._pending:
+            if symbol in self._already_ordered or symbol in pending:
                 return
             if symbol in held:
                 self._already_ordered.add(symbol)
                 return
-            to_order = self._try_queue_or_flush(symbol, gap_pct, price, "TRADE")
+            to_order = self._try_queue_or_flush(symbol, gap_pct, price, "TRADE", pending, confirm)
 
         if to_order:
             loop = asyncio.get_running_loop()
@@ -621,12 +789,12 @@ class SpikeStreamScanner:
             to_order: list[tuple[str, float, float]] = []
             now_ts = time.monotonic()
             with self._order_lock:
-                for sym in list(self._pending):
+                for sym in list(self._pending_liquid):
                     if sym not in self._earnings_today:
                         continue
                     if now_ts - self._pending_ts.get(sym, now_ts) < FLUSH_AFTER:
                         continue
-                    gap_pct, price = self._pending.pop(sym)
+                    gap_pct, price = self._pending_liquid.pop(sym)
                     self._pending_ts.pop(sym, None)
                     self._already_ordered.add(sym)
                     to_order.append((sym, gap_pct, price))
@@ -641,7 +809,9 @@ class SpikeStreamScanner:
     def run(self, execute: bool = False) -> None:
         """Start all three detection layers.  Blocks until market opens or 7:45pm."""
         self._dry_run = self._dry_run or not execute
-        symbols = self.config["watchlist"]
+        liquid = self.config["watchlist"]
+        spec = list(self._spec_symbols)
+        all_symbols = list(dict.fromkeys(liquid + spec))
         feed = _parse_feed(self.config)
 
         print("── Earnings calendar ──")
@@ -651,16 +821,20 @@ class SpikeStreamScanner:
         self.load_earnings_symbols()
 
         print(f"── Starting spike scanner ──  "
-              f"min_gap={self._min_gap:.1f}%  sell_gap=-{self._sell_gap_threshold:.1f}%  "
-              f"notional=${self._notional:.0f}  sector_confirm={self._sector_confirm}  "
-              f"earnings_bypass≥{self._earnings_bypass_gap:.0f}%  "
+              f"liquid={len(liquid)} semis  spec={len(spec)} names  "
+              f"min_gap={self._min_gap:.1f}%  spec_min_gap={self._spec_min_gap:.1f}%  "
+              f"sell_gap=-{self._sell_gap_threshold:.1f}%  "
+              f"notional=${self._notional:.0f}  spec_notional=${self._spec_notional:.0f}  "
+              f"confirm={self._sector_confirm}  spec_confirm={self._spec_sector_confirm}  "
               f"{'DRY-RUN' if self._dry_run else 'LIVE'}")
+        if spec:
+            print(f"  Speculative bucket: {', '.join(sorted(spec))}")
 
         trade_stream = StockDataStream(api_key=self.api_key, secret_key=self.secret_key, feed=feed)
-        trade_stream.subscribe_trades(self._on_trade, *symbols)
+        trade_stream.subscribe_trades(self._on_trade, *all_symbols)
 
         news_stream = NewsDataStream(api_key=self.api_key, secret_key=self.secret_key)
-        news_stream.subscribe_news(self._on_news, *symbols)
+        news_stream.subscribe_news(self._on_news, *all_symbols)
 
         async def _main() -> None:
             from alpaca.trading.client import TradingClient
