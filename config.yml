@@ -461,8 +461,8 @@ adaptive_semis_allocator:
   retain_min_fast_momentum_pct: -3.0
   retain_min_slow_momentum_pct: 5.0
   trailing_stop_pct: 13.0
-  trailing_stop_pct_bull: 17.0
-  trailing_wide_min_profit_pct: 12.0
+  trailing_stop_pct_bull: 22.0
+  trailing_wide_min_profit_pct: 8.0
   hard_stop_pct: 12.0
   regime_filter_enabled: true
   regime_sma_fast_days: 50
@@ -478,8 +478,11 @@ adaptive_semis_allocator:
   score_proportional_sizing: true
   bull_exposure_pct: 0.80
   bull_max_symbols: 5
-  rebalance_days_bull: 3
+  rebalance_days_bull: 7
   bull_drawdown_cap_pct: 10.0
   atr_sizing_enabled: true
   atr_lookback_days: 14
+  breadth_filter_enabled: true
+  breadth_sma_days: 50
+  min_breadth_pct: 0.5
   trades_file: logs/adaptive_semis_trades.csv

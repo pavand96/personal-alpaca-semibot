@@ -160,6 +160,9 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
         bull_sector_min_return = float(settings.get("bull_sector_min_return_pct", 0.0))
         atr_sizing_enabled = bool(settings.get("atr_sizing_enabled", False))
         atr_lookback_days = int(settings.get("atr_lookback_days", 14))
+        breadth_filter_enabled = bool(settings.get("breadth_filter_enabled", False))
+        breadth_sma_days = int(settings.get("breadth_sma_days", 50))
+        min_breadth_pct = float(settings.get("min_breadth_pct", 0.5))
 
         max_lookback = max(
             fast_lookback,
@@ -172,6 +175,7 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
             regime_sma_slow if regime_filter_enabled else 0,
             symbol_sma_filter_days,
             atr_lookback_days + 1,
+            breadth_sma_days if breadth_filter_enabled else 0,
             50,
             30,
         )
@@ -203,11 +207,13 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
             min_momentum_pct=min_market_momentum,
             require_above_sma=require_market_above_sma,
         )
+        breadth = sector_breadth_pct(bars_by_symbol, current_date, breadth_sma_days) if breadth_filter_enabled else 1.0
         risk_off = (
             sector_return <= risk_off_sector_return
             or sector_slow_return < min_sector_slow_return
             or sector_drawdown <= max_sector_drawdown
             or not market_ok
+            or (breadth_filter_enabled and breadth < min_breadth_pct)
         )
         regime = (
             detect_market_regime(risk_bars_by_symbol, current_date, regime_sma_fast, regime_sma_slow)
@@ -401,6 +407,9 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
         bull_drawdown_cap = float(settings.get("bull_drawdown_cap_pct", 0.0)) / 100
         atr_sizing_enabled = bool(settings.get("atr_sizing_enabled", False))
         atr_lookback_days = int(settings.get("atr_lookback_days", 14))
+        breadth_filter_enabled = bool(settings.get("breadth_filter_enabled", False))
+        breadth_sma_days = int(settings.get("breadth_sma_days", 50))
+        min_breadth_pct = float(settings.get("min_breadth_pct", 0.5))
 
         max_lookback = max(
             fast_lookback,
@@ -413,6 +422,7 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
             regime_sma_slow if regime_filter_enabled else 0,
             symbol_sma_filter_days,
             atr_lookback_days + 1,
+            breadth_sma_days if breadth_filter_enabled else 0,
             50,
             30,
         )
@@ -451,6 +461,7 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
                 min_momentum_pct=min_market_momentum,
                 require_above_sma=require_market_above_sma,
             )
+            breadth = sector_breadth_pct(bars_by_symbol, current_date, breadth_sma_days) if breadth_filter_enabled else 1.0
             regime = (
                 detect_market_regime(risk_bars_by_symbol, current_date, regime_sma_fast, regime_sma_slow)
                 if regime_filter_enabled
@@ -540,6 +551,7 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
                     or sector_slow_return < min_sector_slow_return
                     or sector_drawdown <= max_sector_drawdown
                     or not market_ok
+                    or (breadth_filter_enabled and breadth < min_breadth_pct)
                 )
                 bear_blocked = regime_filter_enabled and regime == MarketRegime.BEAR and bear_block_entries
                 target_symbols = (
@@ -786,6 +798,25 @@ def rank_adaptive_candidates(
             )
         )
     return sorted(candidates, key=lambda item: item.score, reverse=True)
+
+
+def sector_breadth_pct(
+    bars_by_symbol: dict[str, list[DailyBar]],
+    current_date: date,
+    sma_days: int,
+) -> float:
+    """Fraction of watchlist symbols trading above their N-day SMA."""
+    above = 0
+    total = 0
+    for bars in bars_by_symbol.values():
+        prior = [b for b in bars if b.timestamp.date() < current_date]
+        if len(prior) < sma_days:
+            continue
+        sma = sum(b.close for b in prior[-sma_days:]) / sma_days
+        total += 1
+        if prior[-1].close > sma:
+            above += 1
+    return above / total if total > 0 else 1.0
 
 
 def compute_atr_weights(
