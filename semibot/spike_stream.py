@@ -1,20 +1,27 @@
 """
-Real-time spike detector using Alpaca WebSocket trade stream.
+Real-time spike detector using Alpaca WebSocket trade + news streams.
 
-Subscribes to live trades for all watchlist symbols.  On every incoming trade,
-computes the gap vs the reference close (yesterday's 4pm close pre-market,
-today's 4pm close after-hours) and immediately places an extended-hours limit
-order the moment the gap threshold is crossed.
+Three detection layers, each faster than the last:
 
-Sector confirmation: orders only fire when spike_sector_confirm distinct
-watchlist symbols have all hit the gap threshold in the same session.  When
-the threshold is met, all pending symbols are ordered simultaneously.
+  1. Startup snapshot scan
+     On launch, immediately snapshots all watchlist symbols.  Any symbol
+     already gapping >= threshold is queued even before the first live trade.
+     Catches stocks that moved while the process was starting up.
 
-Earnings boost: recent Alpaca news is checked at startup; symbols with earnings
-headlines in the last 24h receive a notional multiplier (earnings_notional_multiplier).
+  2. News WebSocket (NewsDataStream, ~seconds after headline)
+     Subscribes to all news for watchlist symbols.  When a catalyst headline
+     arrives (earnings, upgrade, guidance, acquisition, …) a snapshot is
+     fetched for that symbol immediately.
+     - Gap >= earnings_bypass_gap_pct AND earnings/catalyst keywords
+       → order fires right away (no sector confirmation required).
+     - Smaller gaps → queued; fires when sector_confirm threshold is met.
 
-Latency: trade-to-order in ~200ms (stream delivery + one REST call).
-No polling loop — the order fires on the first qualifying trade.
+  3. Trade WebSocket (StockDataStream, ~200ms after first trade)
+     Every live trade for every watchlist symbol is checked.  Orders fire
+     once sector_confirm distinct symbols have all hit the gap threshold.
+
+All three share the same _pending dict, _already_ordered set, and _order_lock,
+so there are no duplicate orders regardless of which layer triggers first.
 """
 from __future__ import annotations
 
@@ -27,7 +34,7 @@ from zoneinfo import ZoneInfo
 
 from alpaca.data.enums import DataFeed
 from alpaca.data.historical import NewsClient, StockHistoricalDataClient
-from alpaca.data.live import StockDataStream
+from alpaca.data.live import NewsDataStream, StockDataStream
 from alpaca.data.requests import NewsRequest, StockSnapshotRequest
 
 from semibot.bot import SemiMomentumBot, floor_order_qty, limit_price_for_side
@@ -39,10 +46,26 @@ log = logging.getLogger(__name__)
 MARKET_TZ = ZoneInfo("America/New_York")
 _REGULAR_CLOSE_HOUR = 16  # 4:00 PM ET
 
+# Broader net: triggers a snapshot check when found in any news headline/summary
+_CATALYST_KEYWORDS = frozenset({
+    # earnings
+    "earnings", "eps", "quarterly", "quarter",
+    "q1", "q2", "q3", "q4", "beats", "beat", "misses", "missed",
+    "revenue", "results", "guidance", "outlook", "profit",
+    # analyst actions
+    "upgrade", "upgraded", "raises", "raised", "price target",
+    "overweight", "outperform", "buy rating",
+    # corporate events
+    "acquisition", "merger", "buyout", "contract", "partnership",
+    # regulatory / product
+    "fda", "approval", "approved", "breakthrough",
+})
+
+# Narrower set: earnings-type events that may bypass sector confirmation
 _EARNINGS_KEYWORDS = frozenset({
     "earnings", "eps", "quarterly", "quarter",
     "q1", "q2", "q3", "q4", "beats", "beat", "misses", "missed",
-    "revenue", "results", "outlook", "guidance", "profit",
+    "revenue", "results", "profit",
 })
 
 
@@ -93,7 +116,7 @@ def fetch_reference_closes(config: dict[str, Any], api_key: str, secret_key: str
 
 
 class SpikeStreamScanner:
-    """WebSocket-based spike detector with sector confirmation and earnings boost."""
+    """Three-layer spike detector: startup snapshot + news WebSocket + trade WebSocket."""
 
     def __init__(self, config: dict[str, Any], api_key: str, secret_key: str) -> None:
         self.config = config
@@ -106,12 +129,13 @@ class SpikeStreamScanner:
         self._sector_confirm = int(self._settings.get("spike_sector_confirm", 1))
         self._tracker_path = str(self._settings.get("spike_tracker_path", "logs/spike_tracker.json"))
         self._earnings_multiplier = float(self._settings.get("earnings_notional_multiplier", 1.0))
+        self._earnings_bypass_gap = float(self._settings.get("earnings_bypass_gap_pct", 8.0))
         self._dry_run = bool(config["risk"].get("dry_run", True))
         self._offset_bps = float(config.get("orders", {}).get("premarket_limit_offset_bps", 25.0))
 
         self._reference_closes: dict[str, float] = {}
         self._already_ordered: set[str] = set()
-        # Symbols that have qualified but are waiting for sector confirmation
+        # Qualified but waiting for sector_confirm threshold
         self._pending: dict[str, tuple[float, float]] = {}  # symbol → (gap_pct, price)
         self._order_lock = threading.Lock()
         self._earnings_symbols: set[str] = set()
@@ -120,7 +144,7 @@ class SpikeStreamScanner:
         self._reference_closes = fetch_reference_closes(self.config, self.api_key, self.secret_key)
 
     def load_earnings_symbols(self) -> None:
-        """Check Alpaca news (last 24h) and flag symbols with earnings headlines."""
+        """Check Alpaca news (last 24h) for earnings/catalyst headlines for each watchlist symbol."""
         now = datetime.now(MARKET_TZ)
         since = now - timedelta(hours=24)
         client = NewsClient(api_key=self.api_key, secret_key=self.secret_key)
@@ -144,7 +168,7 @@ class SpikeStreamScanner:
                 for article in (articles or []):
                     headline = (getattr(article, "headline", "") or "").lower()
                     summary = (getattr(article, "summary", "") or "").lower()
-                    if any(kw in headline + " " + summary for kw in _EARNINGS_KEYWORDS):
+                    if any(kw in headline + " " + summary for kw in _CATALYST_KEYWORDS):
                         found.add(symbol)
                         break
             except Exception as exc:
@@ -152,10 +176,10 @@ class SpikeStreamScanner:
 
         self._earnings_symbols = found
         if found:
-            print(f"Earnings signals detected (notional ×{self._earnings_multiplier:.1f}): "
+            print(f"Catalyst signals detected (notional ×{self._earnings_multiplier:.1f}): "
                   f"{', '.join(sorted(found))}")
         else:
-            print("No earnings signals in last 24h")
+            print("No catalyst signals in last 24h")
 
     def _get_held_symbols(self) -> set[str]:
         try:
@@ -167,7 +191,7 @@ class SpikeStreamScanner:
             return set()
 
     def _place_order(self, symbol: str, gap_pct: float, current_price: float) -> None:
-        """Place an extended-hours limit order.  Called via run_in_executor — keep it synchronous."""
+        """Place an extended-hours limit order.  Safe to call from any thread."""
         from uuid import uuid4
 
         from alpaca.trading.enums import OrderSide, TimeInForce
@@ -176,7 +200,7 @@ class SpikeStreamScanner:
         notional = self._notional
         if self._earnings_multiplier > 1.0 and symbol in self._earnings_symbols:
             notional *= self._earnings_multiplier
-            print(f"  [earnings] {symbol}: notional boosted to ${notional:.0f} (×{self._earnings_multiplier:.1f})")
+            print(f"  [catalyst] {symbol}: notional boosted to ${notional:.0f} (×{self._earnings_multiplier:.1f})")
 
         bot = SemiMomentumBot(self.config, api_key=self.api_key, secret_key=self.secret_key)
         limit_price = limit_price_for_side(current_price, "buy", self._offset_bps)
@@ -215,6 +239,147 @@ class SpikeStreamScanner:
         except Exception as exc:
             log.warning("Could not append spike order event: %s", exc)
 
+    def _try_queue_or_flush(self, symbol: str, gap_pct: float, price: float, source: str) -> list[tuple[str, float, float]]:
+        """Thread-safe: add symbol to pending; return list of (sym, gap, price) to order if threshold met.
+
+        Must be called with _order_lock held by the caller.
+        """
+        self._pending[symbol] = (gap_pct, price)
+        ts = datetime.now(MARKET_TZ).strftime("%H:%M:%S")
+        n = len(self._pending)
+        print(f"[{ts}] {source} PENDING {symbol}: {gap_pct:+.2f}%  [{n}/{self._sector_confirm} for confirm]")
+        if n >= self._sector_confirm:
+            to_flush = list(self._pending.items())
+            for sym, _ in to_flush:
+                self._already_ordered.add(sym)
+            self._pending.clear()
+            return [(sym, g, p) for sym, (g, p) in to_flush]
+        return []
+
+    # ── Layer 1: startup snapshot ─────────────────────────────────────────────
+
+    def _startup_gap_scan(self) -> None:
+        """Snapshot all symbols right after subscription — catches pre-existing gaps."""
+        if not self._reference_closes:
+            return
+        print("Startup gap scan (checking symbols already moving)...")
+        try:
+            client = StockHistoricalDataClient(api_key=self.api_key, secret_key=self.secret_key)
+            snapshots = client.get_stock_snapshot(
+                StockSnapshotRequest(
+                    symbol_or_symbols=self.config["watchlist"],
+                    feed=_parse_feed(self.config),
+                )
+            )
+        except Exception as exc:
+            log.warning("Startup gap scan failed: %s", exc)
+            return
+
+        held = self._get_held_symbols()
+        to_order: list[tuple[str, float, float]] = []
+
+        with self._order_lock:
+            for symbol in self.config["watchlist"]:
+                if symbol in self._already_ordered or symbol in self._pending or symbol in held:
+                    continue
+                snap = snapshots.get(symbol)
+                latest = getattr(snap, "latest_trade", None) if snap else None
+                if not latest:
+                    continue
+                price = float(latest.price)
+                ref = self._reference_closes.get(symbol)
+                if not ref or ref <= 0:
+                    continue
+                gap_pct = ((price / ref) - 1) * 100
+                if gap_pct < self._min_gap or gap_pct > self._max_gap:
+                    if abs(gap_pct) >= 1.0:
+                        print(f"  {symbol}: {gap_pct:+.2f}% (below threshold)")
+                    continue
+                to_order.extend(self._try_queue_or_flush(symbol, gap_pct, price, "STARTUP"))
+
+        for sym, gap, price in to_order:
+            self._place_order(sym, gap, price)
+
+        if not to_order and not self._pending:
+            print("  No pre-existing gaps above threshold")
+
+    # ── Layer 2: news WebSocket ───────────────────────────────────────────────
+
+    def _check_news_gaps(self, symbols: list[str], news_text: str) -> None:
+        """Snapshot news-mentioned symbols and fire/queue immediately.  Runs in a thread."""
+        is_earnings = any(kw in news_text for kw in _EARNINGS_KEYWORDS)
+        try:
+            client = StockHistoricalDataClient(api_key=self.api_key, secret_key=self.secret_key)
+            snapshots = client.get_stock_snapshot(
+                StockSnapshotRequest(
+                    symbol_or_symbols=symbols,
+                    feed=_parse_feed(self.config),
+                )
+            )
+        except Exception as exc:
+            log.warning("News gap snapshot failed: %s", exc)
+            return
+
+        held = self._get_held_symbols()
+        for symbol in symbols:
+            if symbol in self._already_ordered:
+                continue
+            snap = snapshots.get(symbol)
+            latest = getattr(snap, "latest_trade", None) if snap else None
+            if not latest:
+                continue
+            price = float(latest.price)
+            ref = self._reference_closes.get(symbol)
+            if not ref or ref <= 0:
+                continue
+            gap_pct = ((price / ref) - 1) * 100
+            if gap_pct < self._min_gap or gap_pct > self._max_gap:
+                continue
+
+            ts = datetime.now(MARKET_TZ).strftime("%H:%M:%S")
+            bypass = is_earnings and gap_pct >= self._earnings_bypass_gap
+            to_order: list[tuple[str, float, float]] = []
+
+            with self._order_lock:
+                if symbol in self._already_ordered or symbol in self._pending:
+                    continue
+                if symbol in held:
+                    self._already_ordered.add(symbol)
+                    continue
+                if bypass:
+                    print(f"[{ts}] NEWS BYPASS {symbol}: {gap_pct:+.2f}% (earnings ≥{self._earnings_bypass_gap:.0f}% → no sector confirm)")
+                    self._already_ordered.add(symbol)
+                    to_order.append((symbol, gap_pct, price))
+                else:
+                    to_order.extend(self._try_queue_or_flush(symbol, gap_pct, price, "NEWS"))
+
+            for sym, gap, p in to_order:
+                self._place_order(sym, gap, p)
+
+    async def _on_news(self, news: Any) -> None:
+        """News WebSocket handler — fires on every incoming article."""
+        symbols: list[str] = getattr(news, "symbols", []) or []
+        headline = (getattr(news, "headline", "") or "").lower()
+        summary = (getattr(news, "summary", "") or "").lower()
+        text = headline + " " + summary
+
+        if not any(kw in text for kw in _CATALYST_KEYWORDS):
+            return
+
+        watchlist_set = set(self.config["watchlist"])
+        relevant = [s for s in symbols if s in watchlist_set]
+        if not relevant:
+            return
+
+        ts = datetime.now(MARKET_TZ).strftime("%H:%M:%S")
+        headline_preview = (getattr(news, "headline", "") or "")[:90]
+        print(f"[{ts}] NEWS [{', '.join(relevant)}]: {headline_preview}")
+
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self._check_news_gaps, relevant, text)
+
+    # ── Layer 3: trade WebSocket ──────────────────────────────────────────────
+
     async def _on_trade(self, trade: Any) -> None:
         symbol = getattr(trade, "symbol", None)
         if not symbol:
@@ -225,15 +390,13 @@ class SpikeStreamScanner:
 
         price = float(trade.price)
         gap_pct = ((price / ref) - 1) * 100
-
         if gap_pct < self._min_gap or gap_pct > self._max_gap:
             return
 
-        # Fast-path check before acquiring lock
         if symbol in self._already_ordered:
             return
 
-        to_flush: dict[str, tuple[float, float]] | None = None
+        to_order: list[tuple[str, float, float]] = []
         with self._order_lock:
             if symbol in self._already_ordered or symbol in self._pending:
                 return
@@ -241,38 +404,35 @@ class SpikeStreamScanner:
             if symbol in held:
                 self._already_ordered.add(symbol)
                 return
-            self._pending[symbol] = (gap_pct, price)
-            ts = datetime.now(MARKET_TZ).strftime("%H:%M:%S")
-            n_pending = len(self._pending)
-            print(f"[{ts}] SPIKE {symbol}: {gap_pct:+.2f}% vs ref ${ref:.2f} "
-                  f"[{n_pending}/{self._sector_confirm} for sector confirm]")
-            if n_pending >= self._sector_confirm:
-                to_flush = dict(self._pending)
-                for sym in to_flush:
-                    self._already_ordered.add(sym)
-                self._pending.clear()
+            to_order = self._try_queue_or_flush(symbol, gap_pct, price, "TRADE")
 
-        if to_flush:
+        if to_order:
             loop = asyncio.get_event_loop()
-            for sym, (sym_gap, sym_price) in to_flush.items():
-                await loop.run_in_executor(None, self._place_order, sym, sym_gap, sym_price)
+            for sym, gap, p in to_order:
+                await loop.run_in_executor(None, self._place_order, sym, gap, p)
+
+    # ── Entry point ───────────────────────────────────────────────────────────
 
     def run(self, execute: bool = False) -> None:
-        """Start the WebSocket stream.  Blocks until stopped or market opens."""
+        """Start all three detection layers.  Blocks until market opens or 7:45pm."""
         self._dry_run = self._dry_run or not execute
         symbols = self.config["watchlist"]
         feed = _parse_feed(self.config)
 
-        print("Checking earnings calendar...")
+        print("Checking catalyst/earnings calendar...")
         self.load_earnings_symbols()
 
-        print(f"Starting spike stream for {len(symbols)} symbols  "
+        print(f"Starting spike scanner  "
               f"min_gap={self._min_gap:.1f}%  notional=${self._notional:.0f}  "
               f"sector_confirm={self._sector_confirm}  "
+              f"earnings_bypass≥{self._earnings_bypass_gap:.0f}%  "
               f"{'DRY-RUN' if self._dry_run else 'LIVE'}")
 
-        stream = StockDataStream(api_key=self.api_key, secret_key=self.secret_key, feed=feed)
-        stream.subscribe_trades(self._on_trade, *symbols)
+        trade_stream = StockDataStream(api_key=self.api_key, secret_key=self.secret_key, feed=feed)
+        trade_stream.subscribe_trades(self._on_trade, *symbols)
+
+        news_stream = NewsDataStream(api_key=self.api_key, secret_key=self.secret_key)
+        news_stream.subscribe_news(self._on_news, *symbols)
 
         async def _main() -> None:
             from alpaca.trading.client import TradingClient
@@ -282,31 +442,49 @@ class SpikeStreamScanner:
                 paper=bool(self.config["alpaca"].get("paper", True)),
             )
 
+            # Layer 1: check for pre-existing gaps before the first trade arrives
+            self._startup_gap_scan()
+
             async def _watchdog() -> None:
                 while True:
                     await asyncio.sleep(30)
                     now = datetime.now(MARKET_TZ)
                     if now.hour >= 19 and now.minute >= 45:
                         print(f"[{now.strftime('%H:%M:%S')}] Extended-hours window closed (7:45pm) — stopping")
-                        stream.stop()
+                        trade_stream.stop()
+                        news_stream.stop()
                         return
                     try:
                         clock = trading.get_clock()
                         if getattr(clock, "is_open", False):
                             print(f"[{now.strftime('%H:%M:%S')}] Market opened — stopping spike stream")
-                            stream.stop()
+                            trade_stream.stop()
+                            news_stream.stop()
                             return
                     except Exception as exc:
                         log.warning("Clock check failed: %s", exc)
 
-            await asyncio.gather(
-                stream._run_forever(),
-                _watchdog(),
-            )
+            # Layers 2+3 run concurrently; news stream failure is non-fatal
+            try:
+                await asyncio.gather(
+                    trade_stream._run_forever(),
+                    news_stream._run_forever(),
+                    _watchdog(),
+                )
+            except Exception as exc:
+                log.warning("News stream error (%s) — continuing with trade stream only", exc)
+                await asyncio.gather(
+                    trade_stream._run_forever(),
+                    _watchdog(),
+                )
 
         try:
             asyncio.run(_main())
         except KeyboardInterrupt:
             print("Spike stream stopped.")
         finally:
-            stream.stop()
+            trade_stream.stop()
+            try:
+                news_stream.stop()
+            except Exception:
+                pass

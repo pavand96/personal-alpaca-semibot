@@ -466,6 +466,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "spike_sector_confirm": 3,
         "spike_tracker_path": "logs/spike_tracker.json",
         "earnings_notional_multiplier": 1.5,
+        "earnings_bypass_gap_pct": 8.0,
         "trades_file": "logs/adaptive_semis_trades.csv",
     },
 }

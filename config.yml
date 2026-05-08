@@ -495,6 +495,7 @@ adaptive_semis_allocator:
   spike_sector_confirm: 3           # require 3+ watchlist symbols gapping before entering
   spike_tracker_path: logs/spike_tracker.json  # tracks entries for 1-day hold exit
   earnings_notional_multiplier: 1.5  # boost notional 1.5× when earnings detected in news
+  earnings_bypass_gap_pct: 8.0       # news-triggered gaps this large bypass sector confirmation
   score_proportional_sizing: true
   bull_exposure_pct: 0.80
   bull_max_symbols: 5
