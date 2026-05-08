@@ -4,8 +4,6 @@ import csv
 import logging
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
-
-log = logging.getLogger(__name__)
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -26,6 +24,8 @@ from semibot.backtest import (
 )
 from semibot.bot import Decision, SemiMomentumBot, format_decision
 from semibot.intraday import MARKET_TZ
+
+log = logging.getLogger(__name__)
 
 
 class MarketRegime(Enum):

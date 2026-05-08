@@ -2,7 +2,7 @@
 
 This is a small paper-first Alpaca trading script for monitoring semiconductor stocks and optionally placing price-controlled limit orders from momentum rules.
 
-It is not a money printer, and it should not be treated as financial advice. The defaults are intentionally conservative: Alpaca paper trading is enabled, `dry_run` is enabled, and live order submission requires both a config change and the `--execute` flag.
+It is not a money printer, and it should not be treated as financial advice. The current config ships with `alpaca.paper: true` and `risk.dry_run: false` — orders are submitted to your **Alpaca paper account** whenever you pass `--execute`. No real money is at risk with these defaults. To disable all order submission entirely, set `risk.dry_run: true`.
 
 ## Setup
 
@@ -137,15 +137,57 @@ The bot wakes up every `runtime.interval_seconds` seconds. With the default conf
 
 ## Enabling Paper Orders
 
-1. Keep `alpaca.paper: true`.
-2. Set `risk.dry_run: false` in `config.yml`.
-3. Run:
+`risk.dry_run: false` is already set in `config.yml`. Keep `alpaca.paper: true` and pass `--execute` to submit orders to your Alpaca paper account:
 
 ```bash
 python main.py trade-once --execute
 ```
 
 Use paper trading for a while before considering real money. Paper fills and live fills can differ.
+
+## Spike Stream (Extended-Hours Gap Capture)
+
+The spike stream watches all 25 watchlist symbols (20 liquid semis + 5 speculative quantum/AI names) via Alpaca WebSocket in real time and fires limit orders within ~200 ms when 3+ symbols simultaneously gap above threshold.
+
+### Manual run
+
+```bash
+# Pre-market (run at 3:45 AM ET — 15-min warmup before 4:00 AM open)
+scripts/run_spike.sh premarket
+
+# After-hours (run at 4:15 PM ET — stream exits at 7:45 PM ET)
+scripts/run_spike.sh afterhours
+```
+
+The script is phase-aware: it observes only (no orders) during phase 1 (2026-05-08 – 2026-06-05) and submits paper orders during phase 2 (2026-06-08 – 2026-07-07).
+
+### News monitor
+
+Before each spike session the news monitor should run to pre-populate `logs/news_signals.json` with catalyst signals. The spike stream reads this file at startup to set notional boosts.
+
+```bash
+python main.py news-monitor
+```
+
+### Crontab setup
+
+Add the following to your crontab (`crontab -e`). All times are ET (`CRON_TZ=America/New_York` must appear once at the top):
+
+```
+CRON_TZ=America/New_York
+
+# News monitor — runs before each spike window to refresh catalyst signals
+30 3  * * 1-5 cd /home/pavand96/personal-alpaca-semibot && .venv/bin/python main.py news-monitor >> logs/news_monitor_premarket_$(date +\%F).log 2>&1
+0  16 * * 1-5 cd /home/pavand96/personal-alpaca-semibot && .venv/bin/python main.py news-monitor >> logs/news_monitor_afterhours_$(date +\%F).log 2>&1
+
+# Spike stream — pre-market (3:45 AM; lock prevents re-entry if already running)
+45 3  * * 1-5 /home/pavand96/personal-alpaca-semibot/scripts/run_spike.sh premarket
+
+# Spike stream — after-hours (4:15 PM; exits automatically at 7:45 PM)
+15 16 * * 1-5 /home/pavand96/personal-alpaca-semibot/scripts/run_spike.sh afterhours
+```
+
+Logs are written to `logs/spike_premarket_YYYY-MM-DD.log` and `logs/spike_afterhours_YYYY-MM-DD.log`. A flock-based lock prevents duplicate scanner processes if a run extends past the next cron tick.
 
 ## Strategy
 

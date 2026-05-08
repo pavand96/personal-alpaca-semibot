@@ -9,7 +9,7 @@ import yaml
 DEFAULT_CONFIG: dict[str, Any] = {
     "alpaca": {
         "paper": True,
-        "data_feed": "iex",
+        "data_feed": "sip",
     },
     "watchlist": [
         "NVDA",
@@ -195,6 +195,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "orders": {
         "type": "limit",
         "limit_price_offset_bps": 10.0,
+        "premarket_limit_offset_bps": 25.0,
     },
     "live_entry_filter": {
         "enabled": True,
@@ -225,22 +226,28 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "accounting probe",
             "bankruptcy",
             "class action",
+            "criminal",
             "cuts guidance",
             "data breach",
             "delisting",
             "downgrade",
+            "earnings miss",
             "fraud",
+            "going concern",
             "guidance cut",
+            "indicted",
             "investigation",
             "lawsuit",
             "misses estimates",
             "probe",
+            "restatement",
             "recall",
             "resigns",
             "sec investigation",
             "short report",
             "slashes forecast",
             "subpoena",
+            "whistleblower",
         ],
     },
     "buzz_earnings_overlay": {
@@ -251,12 +258,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "news_fetch_chunk_days": 30,
         "news_limit_per_request": 50,
         "article_count_cap": 5,
-        "article_weight": 0.4,
-        "positive_keyword_weight": 1.0,
-        "negative_keyword_weight": 2.0,
+        "article_weight": 0.2,
+        "positive_keyword_weight": 0.3,
+        "negative_keyword_weight": 3.0,
         "score_weight": 2.0,
-        "max_score_boost": 20.0,
-        "negative_score_block_threshold": -3.0,
+        "max_score_boost": 6.0,
+        "negative_score_block_threshold": -2.0,
         "earnings_calendar_file": "data/earnings_calendar.csv",
         "block_new_entries_near_earnings": True,
         "earnings_avoid_days_before": 2,
@@ -304,6 +311,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "runtime": {
         "interval_seconds": 300,
+        "spike_interval_seconds": 60,
         "log_file": "logs/semibot_events.csv",
     },
     "backtest": {
@@ -462,16 +470,29 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "rebound_drawdown_weight": 0.25,
         "spike_min_gap_pct": 5.0,
         "spike_max_gap_pct": 20.0,
-        "spike_notional_per_trade": 1000.0,
+        "spike_notional_per_trade": 200.0,
         "spike_sector_confirm": 3,
+        "spike_max_spread_pct": 2.0,
+        "spike_min_dollar_volume": 50_000.0,
+        "spike_min_trade_count": 2,
+        "spike_min_single_trade_value": 2_000.0,
+        "spike_sell_gap_pct": 5.0,
         "spike_tracker_path": "logs/spike_tracker.json",
         "earnings_notional_multiplier": 1.5,
         "earnings_bypass_gap_pct": 8.0,
+        "earnings_lookahead_days": 7,
         "news_signals_file": "logs/news_signals.json",
         "news_monitor_lookback_minutes": 30,
         "news_signal_ttl_hours": 20,
-        "earnings_lookahead_days": 7,
-        "spike_sell_gap_pct": 5.0,
+        "speculative_watchlist": ["QUBT", "RGTI", "IONQ", "QBTS", "ARQQ"],
+        "spec_spike_min_gap_pct": 10.0,
+        "spec_spike_max_gap_pct": 60.0,
+        "spec_spike_notional": 50.0,
+        "spec_spike_max_spread_pct": 1.0,
+        "spec_spike_min_dollar_volume": 100_000.0,
+        "spec_spike_min_trade_count": 5,
+        "spec_spike_sector_confirm": 2,
+        "spec_spike_min_single_trade_value": 500.0,
         "trades_file": "logs/adaptive_semis_trades.csv",
     },
 }
@@ -688,6 +709,62 @@ def validate_config(config: dict[str, Any]) -> None:
     )
     if float(adaptive["max_total_exposure"]) > float(config["backtest"]["initial_cash"]):
         raise ValueError("adaptive_semis_allocator.max_total_exposure cannot exceed backtest.initial_cash")
+
+    # ── Spike stream fields ───────────────────────────────────────────────────
+    for key in (
+        "spike_notional_per_trade",
+        "spike_min_gap_pct",
+        "spike_max_gap_pct",
+        "spike_sector_confirm",
+        "spike_sell_gap_pct",
+        "earnings_bypass_gap_pct",
+        "earnings_notional_multiplier",
+        "earnings_lookahead_days",
+        "news_monitor_lookback_minutes",
+        "news_signal_ttl_hours",
+    ):
+        if key in adaptive:
+            require_positive(adaptive, key)
+    for key in (
+        "spike_max_spread_pct",
+        "spike_min_dollar_volume",
+        "spike_min_trade_count",
+        "spike_min_single_trade_value",
+    ):
+        if key in adaptive:
+            require_non_negative(adaptive, key)
+    if "spike_min_gap_pct" in adaptive and "spike_max_gap_pct" in adaptive:
+        if float(adaptive["spike_min_gap_pct"]) >= float(adaptive["spike_max_gap_pct"]):
+            raise ValueError(
+                "adaptive_semis_allocator.spike_min_gap_pct must be less than spike_max_gap_pct"
+            )
+
+    # ── Speculative bucket ────────────────────────────────────────────────────
+    adaptive["speculative_watchlist"] = normalize_symbols(
+        adaptive.get("speculative_watchlist", []),
+        allow_empty=True,
+    )
+    for key in (
+        "spec_spike_min_gap_pct",
+        "spec_spike_max_gap_pct",
+        "spec_spike_notional",
+        "spec_spike_sector_confirm",
+    ):
+        if key in adaptive:
+            require_positive(adaptive, key)
+    for key in (
+        "spec_spike_max_spread_pct",
+        "spec_spike_min_dollar_volume",
+        "spec_spike_min_trade_count",
+        "spec_spike_min_single_trade_value",
+    ):
+        if key in adaptive:
+            require_non_negative(adaptive, key)
+    if "spec_spike_min_gap_pct" in adaptive and "spec_spike_max_gap_pct" in adaptive:
+        if float(adaptive["spec_spike_min_gap_pct"]) >= float(adaptive["spec_spike_max_gap_pct"]):
+            raise ValueError(
+                "adaptive_semis_allocator.spec_spike_min_gap_pct must be less than spec_spike_max_gap_pct"
+            )
 
 
 def require_positive(section: dict[str, Any], key: str) -> None:
