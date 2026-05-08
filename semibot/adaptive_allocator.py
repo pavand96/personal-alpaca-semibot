@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,39 @@ from semibot.backtest import (
 )
 from semibot.bot import Decision, SemiMomentumBot, format_decision
 from semibot.intraday import MARKET_TZ
+
+
+class MarketRegime(Enum):
+    BULL = "bull"
+    NEUTRAL = "neutral"
+    BEAR = "bear"
+
+
+def detect_market_regime(
+    risk_bars_by_symbol: dict[str, list[DailyBar]],
+    current_date: date,
+    sma_fast_days: int,
+    sma_slow_days: int,
+) -> MarketRegime:
+    """3-state regime: BULL if SPY > SMA200 and SMA50 > SMA200, BEAR if both fail, else NEUTRAL."""
+    bars_list = list(risk_bars_by_symbol.values())
+    if not bars_list:
+        return MarketRegime.BULL
+    prior = sorted(
+        (b for b in bars_list[0] if b.timestamp.date() <= current_date),
+        key=lambda b: b.timestamp.date(),
+    )
+    if len(prior) < sma_slow_days:
+        return MarketRegime.NEUTRAL
+    sma_slow = sum(b.close for b in prior[-sma_slow_days:]) / sma_slow_days
+    sma_fast = sum(b.close for b in prior[-sma_fast_days:]) / sma_fast_days
+    above_sma200 = prior[-1].close > sma_slow
+    golden_cross = sma_fast > sma_slow
+    if above_sma200 and golden_cross:
+        return MarketRegime.BULL
+    if not above_sma200 and not golden_cross:
+        return MarketRegime.BEAR
+    return MarketRegime.NEUTRAL
 
 
 @dataclass(frozen=True)
@@ -105,6 +139,11 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
         retain_min_fast_momentum_pct = float(settings["retain_min_fast_momentum_pct"])
         retain_min_slow_momentum_pct = float(settings["retain_min_slow_momentum_pct"])
         hard_stop_pct = float(settings["hard_stop_pct"])
+        regime_filter_enabled = bool(settings.get("regime_filter_enabled", False))
+        regime_sma_fast = int(settings.get("regime_sma_fast_days", 50))
+        regime_sma_slow = int(settings.get("regime_sma_slow_days", 200))
+        neutral_sizing_pct = float(settings.get("neutral_sizing_pct", 1.0))
+        bear_block_entries = bool(settings.get("bear_block_entries", True))
 
         max_lookback = max(
             fast_lookback,
@@ -114,6 +153,7 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
             sector_drawdown_lookback,
             market_momentum_lookback,
             market_sma_days,
+            regime_sma_slow if regime_filter_enabled else 0,
             30,
         )
         fetch_start = current_date - timedelta(days=max_lookback * 3)
@@ -150,6 +190,11 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
             or sector_drawdown <= max_sector_drawdown
             or not market_ok
         )
+        regime = (
+            detect_market_regime(risk_bars_by_symbol, current_date, regime_sma_fast, regime_sma_slow)
+            if regime_filter_enabled
+            else MarketRegime.BULL
+        )
 
         candidates = rank_adaptive_candidates(
             bars_by_symbol=bars_by_symbol,
@@ -169,7 +214,8 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
             earnings_by_symbol=earnings_by_symbol,
             settings=overlay_settings,
         )
-        selected = [] if risk_off else candidates[:max_symbols]
+        bear_blocked = regime_filter_enabled and regime == MarketRegime.BEAR and bear_block_entries
+        selected = [] if (risk_off or bear_blocked) else candidates[:max_symbols]
         target_symbols = {candidate.symbol for candidate in selected}
 
         decisions: list[Decision] = []
@@ -225,13 +271,14 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
                 continue
             decisions.append(Decision(symbol, "sell", "adaptive rebalance out", qty=qty))
 
-        if risk_off or not selected:
+        if risk_off or bear_blocked or not selected:
             return decisions
 
         account = bot.trading.get_account()
         equity = float(getattr(account, "equity", 0.0) or 0.0)
         buying_power = float(getattr(account, "buying_power", 0.0) or 0.0)
-        target_notional = min(max_total_exposure, equity) / len(selected)
+        regime_mult = neutral_sizing_pct if (regime_filter_enabled and regime == MarketRegime.NEUTRAL) else 1.0
+        target_notional = min(max_total_exposure, equity) * regime_mult / len(selected)
         queued_buys = 0.0
         for candidate in selected:
             position = positions.get(candidate.symbol)
@@ -289,6 +336,11 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
         trailing_stop_pct = float(settings["trailing_stop_pct"]) / 100
         hard_stop_pct = float(settings["hard_stop_pct"]) / 100
         slippage_bps = float(self.config["backtest"]["slippage_bps"])
+        regime_filter_enabled = bool(settings.get("regime_filter_enabled", False))
+        regime_sma_fast = int(settings.get("regime_sma_fast_days", 50))
+        regime_sma_slow = int(settings.get("regime_sma_slow_days", 200))
+        neutral_sizing_pct = float(settings.get("neutral_sizing_pct", 1.0))
+        bear_block_entries = bool(settings.get("bear_block_entries", True))
 
         max_lookback = max(
             fast_lookback,
@@ -298,6 +350,7 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
             sector_drawdown_lookback,
             market_momentum_lookback,
             market_sma_days,
+            regime_sma_slow if regime_filter_enabled else 0,
             30,
         )
         fetch_start = start - timedelta(days=max_lookback * 3)
@@ -334,6 +387,11 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
                 sma_days=market_sma_days,
                 min_momentum_pct=min_market_momentum,
                 require_above_sma=require_market_above_sma,
+            )
+            regime = (
+                detect_market_regime(risk_bars_by_symbol, current_date, regime_sma_fast, regime_sma_slow)
+                if regime_filter_enabled
+                else MarketRegime.BULL
             )
             for symbol, position in positions.items():
                 if position.qty <= 0 or symbol not in today_bars:
@@ -394,7 +452,11 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
                     or sector_drawdown <= max_sector_drawdown
                     or not market_ok
                 )
-                target_symbols = set() if risk_off else {candidate.symbol for candidate in candidates[:max_symbols]}
+                bear_blocked = regime_filter_enabled and regime == MarketRegime.BEAR and bear_block_entries
+                target_symbols = (
+                    set() if (risk_off or bear_blocked)
+                    else {candidate.symbol for candidate in candidates[:max_symbols]}
+                )
 
                 for symbol, position in positions.items():
                     if position.qty <= 0 or symbol in target_symbols or symbol not in today_bars:
@@ -402,6 +464,7 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
                     if (
                         retain_winners
                         and not risk_off
+                        and not bear_blocked
                         and should_retain_winner(
                             symbol=symbol,
                             position=position,
@@ -432,9 +495,10 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
                         ),
                     )
 
-                selected = candidates[:max_symbols] if not risk_off else []
+                selected = candidates[:max_symbols] if not (risk_off or bear_blocked) else []
                 if selected:
-                    target_notional = min(max_total_exposure, cash + market_value(positions, today_bars)) / len(selected)
+                    regime_mult = neutral_sizing_pct if (regime_filter_enabled and regime == MarketRegime.NEUTRAL) else 1.0
+                    target_notional = min(max_total_exposure, cash + market_value(positions, today_bars)) * regime_mult / len(selected)
                     for candidate in selected:
                         if candidate.symbol not in today_bars:
                             continue

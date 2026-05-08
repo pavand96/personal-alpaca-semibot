@@ -420,6 +420,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "retain_min_slow_momentum_pct": 5.0,
         "trailing_stop_pct": 13.0,
         "hard_stop_pct": 12.0,
+        "regime_filter_enabled": True,
+        "regime_sma_fast_days": 50,
+        "regime_sma_slow_days": 200,
+        "neutral_sizing_pct": 0.5,
+        "bear_block_entries": True,
         "trades_file": "logs/adaptive_semis_trades.csv",
     },
 }
