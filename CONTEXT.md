@@ -6,10 +6,10 @@ Full context for the trading bot: what exists, what was fixed, backtest results,
 
 ## What This Is
 
-A paper-first Alpaca trading bot focused on 25 semiconductor and large-cap tech stocks. Five distinct strategies are implemented. The ML strategy is the primary active one; the others are available for comparison. All strategies default to dry-run mode and require `--execute` to submit real paper orders.
+A paper-first Alpaca trading bot focused on 20 semiconductor stocks. Five distinct strategies are implemented plus a real-time spike capture stream. All strategies default to dry-run mode and require `--execute` to submit real paper orders.
 
-**Watchlist (25 symbols)**
-`NVDA AMD AVGO TSM ASML ARM INTC MU QCOM TXN AMAT LRCX KLAC MRVL ON ADI NXPI SNDK GLW WDC MSFT GOOGL AMZN TSLA META`
+**Watchlist (20 symbols)**
+`NVDA AMD AVGO TSM ASML ARM SMCI MU QCOM TXN AMAT LRCX KLAC MRVL ON ADI NXPI SNDK GLW WDC`
 
 ---
 
@@ -27,9 +27,121 @@ Logistic regression on 17 daily-bar features. Predicts whether a stock will be �
 ### 4. Sector Momentum Allocator (`sector_allocator.py`)
 Selects the highest-momentum semiconductor symbol at the open. Requires sector 5-day return ≥ 0.5%. Tiered exits: 50% at +1%, rest at +8%.
 
-### 5. Swing / Balanced Allocators (`swing_allocator.py`, `balanced_allocator.py`)
-Swing: rebalances every 3 days on 20-day/5-day momentum with 20% trailing stop.
-Balanced: splits $5k into swing sleeve and $4.5k into confirmed intraday sleeve.
+### 5. Adaptive Semis Allocator (`adaptive_allocator.py`) — active live strategy
+Multi-signal ranking: combines momentum, trend, relative strength, breadth, volume, and gap boost. Risk filters: regime (50/200 SMA), bear block, sector drawdown, market SMA. Includes:
+- **Rebound mode**: override of risk filters when sector drawdown ≥ 8% and short-term breadth/returns start recovering. +2.84pp vs baseline in the Apr 2025 selloff.
+- **Spike 1-day hold exit**: `spike_tracker.json` records every spike entry; on each live run `get_symbols_to_exit()` generates sell decisions for positions held since yesterday.
+- **Earnings notional boost**: 1.5× notional when an earnings catalyst signal is active for the symbol.
+
+### 6. Spike Stream Scanner (`spike_stream.py`) — pre/after-market
+Real-time WebSocket scanner running outside regular hours. Three detection layers:
+
+**Layer 1 — Startup snapshot** (3:45 AM)
+Immediately after stream launch, snapshots all 20 watchlist symbols. Any symbol already gapping ≥ `spike_min_gap_pct` (5%) is queued. Catches stocks that moved while the process was starting up and any overnight catalyst that became visible before the first trade arrives.
+
+**Layer 2 — News WebSocket** (seconds after headline)
+`NewsDataStream` subscribes to all news for watchlist symbols. On any catalyst headline (earnings/upgrade/guidance/acquisition keywords) a snapshot is fetched immediately.
+- Gap ≥ `earnings_bypass_gap_pct` (8%) AND earnings keywords → order fires at once (no sector confirmation)
+- High-score pre-detected signals (score ≥ 4) lower bypass threshold to 6%
+- Smaller gaps → queued; fires when sector_confirm threshold is met
+
+**Layer 3 — Trade WebSocket** (200ms after first trade)
+`StockDataStream` receives every live trade for every watchlist symbol. Orders fire once `spike_sector_confirm` (3) distinct symbols have all hit the gap threshold.
+
+**Shared state**: `_pending` dict, `_already_ordered` set, `_order_lock` (threading.Lock). Whichever layer triggers first wins; the others are no-ops.
+
+**Bidirectional on earnings day**: `_earnings_today` (from yfinance) tracks symbols reporting today. Gap ≤ -5% on an earnings day → sell existing position (`_place_sell_order`). `_check_earnings_miss()` is called before buy logic in all three layers.
+
+**Reference closes**:
+- Pre-market: `previous_daily_bar.close` (yesterday 4 PM)
+- After-hours: `daily_bar.close` (today's locked 4 PM)
+
+---
+
+## Cron Schedule (`cron/semibot.cron`)
+
+```
+CRON_TZ=America/New_York
+
+# News monitor — every 15 min all day and night
+*/15 * * * 1-5    python main.py news-monitor
+
+# Pre-market spike stream (3:45 AM = 15 min before pre-market opens at 4 AM)
+# Fallbacks at 6:45 AM and 8:45 AM (flock prevents duplicates)
+45 3 * * 1-5      scripts/run_spike.sh premarket
+45 6 * * 1-5      scripts/run_spike.sh premarket
+45 8 * * 1-5      scripts/run_spike.sh premarket
+
+# Adaptive semis (regular session: 9:45 AM – 4:10 PM, every 5 min)
+45,50,55 9 * * 1-5   scripts/run_ml_trade.sh
+*/5 10-15 * * 1-5    scripts/run_ml_trade.sh
+0,5,10 16 * * 1-5    scripts/run_ml_trade.sh
+
+# After-hours spike stream (4:15 PM, self-exits at 7:45 PM)
+15 16 * * 1-5     scripts/run_spike.sh afterhours
+```
+
+The 15-minute head start at 3:45 AM is used to: load earnings calendar (yfinance), load news signals file, fetch reference closes, connect both WebSocket streams. Zero lag when pre-market opens at 4:00:00 AM.
+
+---
+
+## News Monitor (`news_monitor.py`)
+
+Runs every 15 minutes all day and night via cron. Polls Alpaca news API for every watchlist symbol, classifies headlines, and writes `logs/news_signals.json`. The spike stream reads this file at startup so it is pre-warmed with overnight context.
+
+**Signal classification:**
+| Type | Keywords | Score |
+|------|----------|-------|
+| earnings | eps, beat, quarterly, revenue, results, … | 2 + matched count (max 5) |
+| upgrade | upgrade, raises, price target, outperform, … | 2 |
+| corporate | acquisition, merger, FDA, approval, guidance, … | 2 |
+| general | (catch-all with any catalyst keyword) | 1 |
+
+**Signal fields per symbol:** `headline`, `detected_at`, `catalyst_type`, `keywords`, `score`, `bypass_confirm`
+
+Signals expire after `news_signal_ttl_hours` (20h). At startup the spike stream also runs a fresh 24h scan and merges it with the file.
+
+---
+
+## Earnings Calendar (`earnings_calendar.py`)
+
+Wraps yfinance. Called at stream startup (3:45 AM) and by the news monitor cron.
+
+- `fetch_earnings_calendar(symbols, lookahead_days=14)` → `dict[str, date]` — earnings dates per symbol
+- `get_reporting_today(symbols)` → `list[str]` — symbols reporting today (bidirectional mode)
+- `get_reporting_soon(symbols, days=7)` → `dict[str, date]` — upcoming reporters
+- `enrich_signals_with_calendar(signals, symbols, days=14)` — adds `earnings_days_away` and sets `bypass_confirm: true` for today's reporters
+- `print_earnings_schedule(symbols, days=14)` — formatted table printed at startup
+
+---
+
+## Spike Tracker (`spike_tracker.py`)
+
+Records every spike stream buy to `logs/spike_tracker.json`. Each entry: `symbol`, `entry_date`, `gap_pct`, `entry_price`.
+
+- `record_spike_entry(path, symbol, gap_pct, entry_price)` — writes/updates entry
+- `remove_spike_entry(path, symbol)` — called after earnings-miss sell
+- `get_symbols_to_exit(path, today)` → `list[str]` — symbols where `entry_date < today`
+
+`live_decisions()` in `adaptive_allocator.py` calls `get_symbols_to_exit()` on every regular-session run and generates sell decisions for next-day exits.
+
+---
+
+## Rebound Mode
+
+Triggers when: sector drawdown ≥ 8% (`rebound_trigger_drawdown_pct`) AND short-term (5-day) sector return ≥ 2% AND market return ≥ -0.5% AND breadth recovering (≥ 35% of symbols above 5-day SMA).
+
+When active: overrides risk-off filters and bear-block, uses reduced exposure (55%), wider rebalance (2 days), and ranks candidates by `ReboundContext` — weighted combo of 3-day recovery, volume surge, and drawdown depth.
+
+Backtested: +2.84pp over baseline during the April 2025 tariff selloff.
+
+---
+
+## Phased Paper Trading
+
+- **Dry-run phase** (May 8 – Jun 5, 2026): `run_spike.sh` logs only, zero orders
+- **Paper phase** (Jun 8 – Jul 7, 2026): `--execute` passed, Alpaca paper account (`paper: true`)
+- Cron `flock` prevents duplicate spike stream instances from the fallback launches
 
 ---
 
@@ -51,8 +163,8 @@ Balanced: splits $5k into swing sleeve and $4.5k into confirmed intraday sleeve.
 
 **Label:** `1` if `close[t + horizon_days] / close[t] - 1 >= target_return_pct`, else `0`.
 **Defaults:** `horizon_days=3`, `target_return_pct=1.0%`.
-**Model type:** `logistic_regression` (also supports `random_forest`, `hist_gradient_boosting`).
-**Validation:** Time-series 5-fold cross-validation with 1-day gap.
+**Model type:** `hist_gradient_boosting` (handles missing values natively, more robust to class imbalance).
+**Validation:** Time-series 5-fold cross-validation with 10-day gap (prevents lookahead across the 3-day prediction horizon).
 **Typical AUC:** 0.50–0.56 (barely above random — the market is hard to predict short-term).
 
 ### Training
@@ -67,25 +179,23 @@ python main.py train-model --start 2020-01-01 --end 2024-05-06
 python main.py train-model --start 2018-01-01 --end 2022-05-06
 ```
 
-**Retraining cadence:** Quarterly. Do not retrain daily — the model would overfit to recent noise and become unstable. Suggested schedule: first trading day of each quarter.
+**Retraining cadence:** Quarterly. Do not retrain daily — the model would overfit to recent noise and become unstable.
 
 ---
 
 ## ML Strategy — Config Overrides
 
-The `ml:` section can override global `risk:` and `strategy:` sizing without affecting other strategies:
+The `ml:` section overrides global `risk:` and `strategy:` sizing without affecting other strategies:
 
 ```yaml
 ml:
-  stop_loss_pct: 10.0           # overrides risk.stop_loss_pct (was 0.5 — see bug #1 below)
-  trailing_stop_pct: 18.0       # overrides risk.trailing_stop_pct
-  per_trade_notional: 100.0     # overrides strategy.per_trade_notional
-  max_position_notional: 2000.0 # overrides strategy.max_position_notional
-  max_symbols_to_buy_per_run: 3 # overrides strategy.max_symbols_to_buy_per_run
-  take_profit_pct: 1.0          # overrides risk.take_profit_pct (live path only)
+  stop_loss_pct: 10.0
+  trailing_stop_pct: 18.0
+  per_trade_notional: 100.0       # or per_trade_pct_of_equity: 0.5
+  max_position_notional: 500.0
+  max_symbols_to_buy_per_run: 1
+  take_profit_pct: 3.0
 ```
-
-These overrides are validated: positive where required, `per_trade_notional ≤ max_position_notional` enforced.
 
 ---
 
@@ -115,7 +225,7 @@ account_drawdown_pct = abs(min(0.0, (equity - kill_switch_peak) / kill_switch_pe
 
 ### Bug 3 — ML live path ignored `ml.*` overrides
 
-**What broke:** `ml_trade_once()` (live trading) read `per_trade_notional`, `max_position_notional`, `max_symbols_to_buy_per_run`, and `stop_loss_pct` from the global `strategy:` and `risk:` sections. The `ml:` overrides only applied during backtests, so live trading was using different (wrong) parameters.
+**What broke:** `ml_trade_once()` (live trading) read `per_trade_notional`, `max_position_notional`, `max_symbols_to_buy_per_run`, and `stop_loss_pct` from the global `strategy:` and `risk:` sections. The `ml:` overrides only applied during backtests.
 
 **Fix:** Updated `ml_trade_once()` to use `ml_settings.get(key, fallback)` for all five parameters, matching the backtest path.
 
@@ -123,25 +233,69 @@ account_drawdown_pct = abs(min(0.0, (equity - kill_switch_peak) / kill_switch_pe
 
 **What broke:** `round(decision.notional / limit_price, 6)` could round the 6th decimal place up, making the order cost fractionally more than the intended notional.
 
-**Fix:** Extracted `floor_order_qty(notional, price)` helper using `math.floor(... * 1_000_000) / 1_000_000`, guaranteeing `qty * price ≤ notional`.
+**Fix:** Extracted `floor_order_qty(notional, price)` helper using `math.floor(... * 1_000_000) / 1_000_000`.
 
 ### Bug 5 — Kill-switch flatten capped by `max_orders_per_run`
 
 **What broke:** When the daily-loss kill switch fired, the flatten sell orders fell through the same `max_orders_per_run` gate as normal orders. With `max_orders_per_run: 3` and 6 open positions, only 3 would be sold.
 
-**Fix:** `bot.py` sets `is_flatten = True` and skips the gate (`if not is_flatten and len(submitted) >= max_orders`). `ml.py` passes `max_orders=len(decisions)` for the flatten path.
+**Fix:** `bot.py` sets `is_flatten = True` and skips the gate. `ml.py` passes `max_orders=len(decisions)` for the flatten path.
 
 ### Bug 6 — `max_daily_loss_pct: 0` rejected by validation
 
-**What broke:** The validator used `require_positive` for `max_daily_loss_pct`, rejecting zero. Zero is a valid value meaning "kill switch disabled" (the runtime already handles `≤ 0` as disabled).
+**Fix:** Changed validator from `require_positive` to `require_non_negative`.
 
-**Fix:** Changed to `require_non_negative`.
+### Bug 7 — ML parameter optimizer mutated wrong config sections
 
-### Bug 7 — ML parameter optimizer mutated global config sections
+**What broke:** `optimize_parameters()` wrote trial values to `trial_config["strategy"]` and `trial_config["risk"]`, but `ml_backtest()` reads overrides from `trial_config["ml"]`. Optimizer trials were writing to sections the backtest no longer read.
 
-**What broke:** `optimize_parameters()` wrote trial values to `trial_config["strategy"]` and `trial_config["risk"]`, but `ml_backtest()` now reads overrides from `trial_config["ml"]`. So optimizer trials were writing to sections the backtest no longer read.
+**Fix:** Optimizer now writes all five tunable params to `trial_config["ml"]`.
 
-**Fix:** Optimizer now writes all five tunable params to `trial_config["ml"]`, matching the read path.
+---
+
+## Known Issues / Active Bugs
+
+### Issue 1 — Deadlock in `_startup_gap_scan` (CRITICAL)
+
+`_startup_gap_scan` acquires `_order_lock` in a `with` block and then calls `_check_earnings_miss()` which also tries to acquire `_order_lock`. Python's `threading.Lock` is not reentrant → deadlock on the first earnings-miss-eligible symbol at startup.
+
+**Fix needed:** Move the `_check_earnings_miss` call outside the `with self._order_lock:` block in `_startup_gap_scan`, or restructure the loop so the earnings miss check runs before entering the lock.
+
+### Issue 2 — `_get_held_symbols()` REST call inside `_order_lock` in `_on_trade`
+
+In `_on_trade`, `_get_held_symbols()` is called while holding `_order_lock`. This is a blocking REST call (~200ms) that blocks all other trade and news callbacks queued in the executor. Result: the trade stream falls behind in high-volume pre-market conditions.
+
+**Fix needed:** Cache `_held_symbols` with a ~30s TTL. Refresh asynchronously outside the lock.
+
+### Issue 3 — IEX data feed misses most pre-market trades
+
+`data_feed: iex` is configured. IEX's free tier only covers regular NYSE/NASDAQ hours reliably. Between 4:00 AM and 9:30 AM, most pre-market trades route through ECNs (ARCA, BATS) not covered by IEX. The trade WebSocket (Layer 3) will see very few, possibly zero, pre-market ticks for many symbols.
+
+**Impact:** Layer 3 (trade WebSocket) is nearly blind in pre-market. Only Layer 1 (startup snapshot) and Layer 2 (news WebSocket) will fire reliably.
+
+**Fix needed:** Either upgrade to SIP data feed (paid Alpaca plan) for full pre-market coverage, or document that Layer 3 is effectively a no-op before 9:30 AM and rely on Layers 1 and 2 exclusively.
+
+### Issue 4 — `latest_trade` in startup snapshot may be stale
+
+At 3:45 AM, `snap.latest_trade` from the historical snapshot API may be yesterday's last trade (4:00 PM prior day). If no pre-market trade has occurred yet, the gap calculation uses a stale price and the startup scan will miss symbols that have gapped in news flow but not yet traded.
+
+**Fix needed:** Fall back to `snap.minute_bar` or `snap.daily_bar.open` (which reflects the current pre-market price via the open field on the snapshot) when `latest_trade` is from a prior session.
+
+### Issue 5 — Watchdog `>= 19 and >= 45` bug
+
+`if now.hour >= 19 and now.minute >= 45:` does not correctly express "after 7:45 PM." At 20:00 (8 PM), `now.minute` is 0, so `0 >= 45` is False and the watchdog never stops. The stream would run past 8 PM.
+
+**Fix needed:**
+```python
+cutoff = now.replace(hour=19, minute=45, second=0, microsecond=0)
+if now >= cutoff:
+```
+
+### Issue 6 — `sector_confirm=3` blocks single-stock earnings beats
+
+If only NVDA reports a blowout quarter while the sector is mixed, `_pending` never reaches 3 symbols and no order fires — even with a 15% gap. The news bypass helps (≥8% gap skips confirmation) but only if news arrives via the WebSocket. If the gap is 6% and the news WebSocket hasn't fired yet, the startup snapshot will queue NVDA in `_pending` and it will sit there indefinitely.
+
+**Fix:** After a configurable timeout (e.g. 60s) flush any pending symbol in `_earnings_today` regardless of sector confirm count.
 
 ---
 
@@ -167,75 +321,26 @@ All results use `backtest.initial_cash: $10,000`. Benchmark is equal-weight buy-
 | **ML strategy** | **+168.81%** | **$26,881** | -27.75% |
 | SEMIS_EQ benchmark | +418.05% | $51,805 | -34.04% |
 
-### Last 3 months (2026-02-07 → 2026-05-07, existing model, no retrain)
+### Last 3 months (2026-02-07 → 2026-05-07, existing model)
 | | Return | Ending | Drawdown | Win rate |
 |---|---|---|---|---|
 | **ML strategy** | **+36.33%** | **$13,633** | -8.39% | 82.4% |
 | SEMIS_EQ benchmark | +43.39% | $14,340 | -13.37% | — |
 
-### Single day (2026-05-07, signals from 2026-05-06)
-Bought MRVL, GLW, ASML. All liquidated at close. Net: **-$9.33 (-0.09%)** vs sector -0.63%.
-
-### Key observation
-The strategy consistently produces lower drawdown than buy-and-hold (e.g. -8.39% vs -13.37% over 3 months). The gap to the benchmark is the cost of risk management in a sustained bull market — any strategy that exits positions during a persistent uptrend will underperform.
-
 ---
 
 ## Parameter Optimizer
 
-Searches over stop loss, trailing stop, position sizing, and probability thresholds. Best result (1-year, 2025–2026):
 ```
 buy_probability=0.50, sell_probability=0.25, per_trade_notional=100, max_position_notional=2000,
 max_symbols_to_buy_per_run=3, stop_loss_pct=10.0, trailing_stop_pct=18.0
 → return=+43.58%, max_drawdown=-7.94%, trades=165
 ```
 
-These values are now the defaults in the `ml:` section of `config.yml`. To re-run the optimizer on a new date range:
+To re-run:
 ```bash
 python main.py optimize-ml-params --start 2025-01-01 --end 2026-05-07
 ```
-
----
-
-## News Integration (current state)
-
-The `news_hold` config section already blocks buys on negative keywords (downgrade, investigation, earnings miss, etc.) using Alpaca's news API. This runs as part of `live_entry_quality()` in `ml_trade_once()`.
-
-### What can be added
-
-**Earnings calendar guard (low effort):** Skip buying within 2 trading days of an earnings announcement by checking for `"earnings"` / `"quarterly"` in recent headlines. Gap risk on earnings days is high and unpredictable from price features alone.
-
-**News-driven entry confirmation (medium effort):** Allow borderline ML signals (probability 0.45–0.50) to pass through when positive news is present (upgrade, beat estimates, raised guidance). Requires a small positive-keywords list alongside the block list.
-
-**News velocity as ML feature (higher effort):** Add `news_count_24h` as a numeric feature — high article count signals uncertainty. Requires news API calls per symbol during training, which is slow for bulk historical training but fine for live inference.
-
----
-
-## Roadmap / Improvements
-
-### Walk-forward retraining (highest impact)
-Retrain the model every quarter on a rolling 4-year window. Semiconductor market structure changes (AI cycles, tariff regimes). A stale model trained in 2018 is not calibrated to 2026 conditions. Implementation: `train_and_backtest_rolling(start, end, retrain_every_n_days=63)` that walks forward and retrains in-loop.
-
-### Sector-relative features (high signal quality, low effort)
-Add `return_vs_sector_5d`, `return_vs_sector_20d` — each stock's return minus the equal-weight average of the watchlist over the same window. Tells the model "NVDA up 5% while sector is flat" vs "everything up 5%." The former is real alpha; the latter is beta. Computable in `build_feature_row` since `bars_by_symbol` is already available.
-
-### Parallel optimizer (use all CPU cores, zero algorithmic change)
-The optimizer runs 80 trials sequentially. Wrapping the trial loop with `joblib.Parallel(n_jobs=-1)` gives linear speedup with core count. Could expand the grid to 500+ trials covering wider ranges at the same wall-clock time.
-
-### RSI and Bollinger Band features (medium impact, low effort)
-RSI (14-day) normalizes momentum across volatility regimes. Bollinger Band distance captures mean-reversion vs trend-following setups. Both computable from existing daily bars with no new data fetches.
-
-### Ensemble voting (moderate impact, moderate effort)
-Train logistic regression, random forest, and gradient boosting independently on the same features, then average their probabilities. Reduces variance from any single model's quirks without much overfitting risk if each model is individually regularized.
-
----
-
-## CI
-
-`.github/workflows/ci.yml` runs on push and PR to `main`:
-1. `pip install -e ".[dev]"` — installs package in editable mode plus pytest and ruff
-2. `ruff check .` — lint
-3. `pytest tests/ -v` — 24 tests
 
 ---
 
@@ -243,61 +348,60 @@ Train logistic regression, random forest, and gradient boosting independently on
 
 ```
 semibot/
-├── bot.py              # Daily momentum bot + order submission
-├── backtest.py         # Daily bar backtester (all strategies share this)
-├── intraday.py         # Intraday opening momentum strategy
-├── ml.py               # ML strategy: training, backtest, live, optimizer
-├── sector_allocator.py # Sector momentum allocator
-├── swing_allocator.py  # Swing trading allocator
-├── balanced_allocator.py # Multi-sleeve allocator
-├── config.py           # Config loader and validator
-└── events.py           # CSV event logger
+├── bot.py                  # Daily momentum bot + order submission
+├── backtest.py             # Daily bar backtester (shared by all strategies)
+├── intraday.py             # Intraday opening momentum strategy
+├── ml.py                   # ML strategy: training, backtest, live, optimizer
+├── sector_allocator.py     # Sector momentum allocator
+├── swing_allocator.py      # Swing trading allocator
+├── balanced_allocator.py   # Multi-sleeve allocator
+├── adaptive_allocator.py   # Adaptive semis allocator (active live strategy)
+├── spike_stream.py         # Real-time WebSocket spike scanner (pre/after-market)
+├── spike_tracker.py        # Persists spike entries → drives 1-day hold exits
+├── news_monitor.py         # Background news scanner (runs via cron all day/night)
+├── earnings_calendar.py    # yfinance earnings dates (today reporters + lookahead)
+├── premarket_backtest.py   # Premarket gap backtest (open vs prev close proxy)
+├── config.py               # Config loader and validator
+└── events.py               # CSV event logger
 
 models/
-└── semibot_model.joblib  # Trained model artifact (retrain quarterly)
+└── semibot_model.joblib     # Trained model artifact (retrain quarterly)
 
 logs/
-├── ml_backtest_trades.csv
-├── ml_parameter_optimization.csv
-└── paper_run_*.log
+├── news_signals.json        # Written by news-monitor cron, read at stream startup
+├── spike_tracker.json       # Records spike buys for 1-day hold exit
+├── news_monitor.log         # Cron output for news monitor
+├── spike_premarket.log      # Cron output for spike stream
+└── semibot_events.csv       # All order events (append-only)
 
-tests/                  # 24 pytest tests, all passing
-.github/workflows/ci.yml
-config.yml              # All strategy parameters
+cron/
+└── semibot.cron             # Full cron schedule (install with crontab)
+
+scripts/
+├── run_spike.sh             # Phased launch (dry-run / paper) with flock
+└── run_ml_trade.sh          # Regular-session adaptive semis launcher
 ```
 
 ---
 
-## Key Config Values (current)
+## Key Config Values (spike stream)
 
 ```yaml
-backtest:
-  initial_cash: 10000.0
-  slippage_bps: 5.0
+adaptive_semis_allocator:
+  spike_min_gap_pct: 5.0          # enter if gap >= 5%
+  spike_max_gap_pct: 20.0         # skip if gap > 20% (reversal risk)
+  spike_notional_per_trade: 1000.0
+  spike_sector_confirm: 3         # require 3+ symbols gapping simultaneously
+  spike_tracker_path: logs/spike_tracker.json
+  earnings_notional_multiplier: 1.5
+  earnings_bypass_gap_pct: 8.0    # skip sector confirm for large earnings gaps
+  news_signals_file: logs/news_signals.json
+  news_monitor_lookback_minutes: 30
+  news_signal_ttl_hours: 20
+  earnings_lookahead_days: 7
+  spike_sell_gap_pct: 5.0         # sell position on earnings-day gap <= -5%
 
-ml:
-  model_type: logistic_regression
-  horizon_days: 3
-  target_return_pct: 1.0
-  buy_probability: 0.60       # 0.50 is no filter for logistic regression
-  sell_probability: 0.25
-  feature_lookback_days: 100
-  # ML-specific risk overrides (tuned by optimizer):
-  stop_loss_pct: 10.0
-  trailing_stop_pct: 18.0
-  take_profit_pct: 3.0        # 3-day horizon needs room; 1% exits too early
-  per_trade_notional: 100.0
-  max_position_notional: 2000.0
-  max_symbols_to_buy_per_run: 3
-
-risk:
-  # These three are ML strategy fallbacks only — overridden by ml.* above.
-  # The daily momentum strategy does NOT use stop_loss_pct or take_profit_pct;
-  # it exits solely via strategy.sell_threshold_pct.
-  stop_loss_pct: 5.0
-  trailing_stop_pct: 10.0
-  take_profit_pct: 3.0
-  max_account_drawdown_pct: 15.0
-  max_daily_loss_pct: 3.0
-  max_orders_per_run: 3       # does NOT cap kill-switch flatten orders
+alpaca:
+  paper: true
+  data_feed: iex   # ← upgrade to sip for full pre-market trade coverage
 ```

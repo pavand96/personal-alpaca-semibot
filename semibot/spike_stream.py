@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -67,6 +68,50 @@ _EARNINGS_KEYWORDS = frozenset({
     "q1", "q2", "q3", "q4", "beats", "beat", "misses", "missed",
     "revenue", "results", "profit",
 })
+
+
+def _best_price_from_snap(snap: Any) -> float | None:
+    """Most current price from a snapshot.
+
+    Prefers latest_trade if it occurred today (pre-market counts).
+    Falls back to quote midpoint when latest_trade is from a prior session —
+    quotes arrive before trades print, so we can detect a 4 AM gap even when
+    no ECN trade has executed yet.
+    """
+    if not snap:
+        return None
+    today = datetime.now(MARKET_TZ).date()
+
+    latest = getattr(snap, "latest_trade", None)
+    if latest:
+        ts = getattr(latest, "timestamp", None)
+        try:
+            trade_date = ts.astimezone(MARKET_TZ).date() if ts is not None else None
+        except Exception:
+            trade_date = None
+        if trade_date == today:
+            p = float(latest.price)
+            if p > 0:
+                return p
+
+    # latest_trade is stale — use NBBO midpoint
+    quote = getattr(snap, "latest_quote", None)
+    if quote:
+        ask = float(getattr(quote, "ask_price", 0) or 0)
+        bid = float(getattr(quote, "bid_price", 0) or 0)
+        if ask > 0 and bid > 0:
+            return (ask + bid) / 2.0
+        if ask > 0:
+            return ask
+        if bid > 0:
+            return bid
+
+    # Last resort: stale trade price (gap ≈ 0%, filtered downstream)
+    if latest:
+        p = float(latest.price)
+        if p > 0:
+            return p
+    return None
 
 
 def _parse_feed(config: dict[str, Any]) -> DataFeed:
@@ -140,12 +185,16 @@ class SpikeStreamScanner:
         self._already_sold: set[str] = set()
         # Qualified but waiting for sector_confirm threshold
         self._pending: dict[str, tuple[float, float]] = {}  # symbol → (gap_pct, price)
+        self._pending_ts: dict[str, float] = {}             # symbol → monotonic time of entry
         self._order_lock = threading.Lock()
         self._earnings_symbols: set[str] = set()
         # Per-symbol bypass gap threshold — lowered for high-score pre-detected signals
         self._bypass_gap_by_symbol: dict[str, float] = {}
         # Symbols with earnings TODAY — bidirectional (buy beat, sell miss)
         self._earnings_today: set[str] = set()
+        # Held-symbols REST cache (refreshed at most every 30s)
+        self._held_cache: set[str] = set()
+        self._held_cache_ts: float = 0.0
 
     def load_references(self) -> None:
         self._reference_closes = fetch_reference_closes(self.config, self.api_key, self.secret_key)
@@ -177,7 +226,6 @@ class SpikeStreamScanner:
         High-score signals (earnings score >= 4) lower the bypass threshold so even
         a 6% gap triggers an immediate order without waiting for sector confirmation.
         """
-        from semibot.news_monitor import _CATALYST_KEYWORDS as MON_KEYWORDS
         from semibot.news_monitor import load_signals_file, scan_news
 
         settings = self._settings
@@ -227,14 +275,20 @@ class SpikeStreamScanner:
         else:
             print("No catalyst signals detected")
 
+    _HELD_CACHE_TTL = 30.0  # seconds between position REST fetches
+
     def _get_held_symbols(self) -> set[str]:
+        now = time.monotonic()
+        if now - self._held_cache_ts < self._HELD_CACHE_TTL:
+            return self._held_cache
         try:
             bot = SemiMomentumBot(self.config, api_key=self.api_key, secret_key=self.secret_key)
             positions = bot.get_positions()
-            return {s for s, p in positions.items() if float(getattr(p, "qty", 0)) > 0}
+            self._held_cache = {s for s, p in positions.items() if float(getattr(p, "qty", 0)) > 0}
+            self._held_cache_ts = now
         except Exception as exc:
             log.warning("Could not fetch positions: %s", exc)
-            return set()
+        return self._held_cache
 
     def _place_order(self, symbol: str, gap_pct: float, current_price: float) -> None:
         """Place an extended-hours limit order.  Safe to call from any thread."""
@@ -370,6 +424,7 @@ class SpikeStreamScanner:
         Must be called with _order_lock held by the caller.
         """
         self._pending[symbol] = (gap_pct, price)
+        self._pending_ts[symbol] = time.monotonic()
         ts = datetime.now(MARKET_TZ).strftime("%H:%M:%S")
         n = len(self._pending)
         print(f"[{ts}] {source} PENDING {symbol}: {gap_pct:+.2f}%  [{n}/{self._sector_confirm} for confirm]")
@@ -378,6 +433,7 @@ class SpikeStreamScanner:
             for sym, _ in to_flush:
                 self._already_ordered.add(sym)
             self._pending.clear()
+            self._pending_ts.clear()
             return [(sym, g, p) for sym, (g, p) in to_flush]
         return []
 
@@ -403,21 +459,32 @@ class SpikeStreamScanner:
         held = self._get_held_symbols()
         to_order: list[tuple[str, float, float]] = []
 
+        # Build price map first (no lock needed).
+        # _best_price_from_snap falls back to NBBO midpoint when latest_trade is stale,
+        # so we can detect gaps even if no pre-market trade has printed yet.
+        sym_data: list[tuple[str, float, float]] = []
+        for symbol in self.config["watchlist"]:
+            price = _best_price_from_snap(snapshots.get(symbol))
+            if price is None:
+                continue
+            ref = self._reference_closes.get(symbol)
+            if not ref or ref <= 0:
+                continue
+            gap_pct = ((price / ref) - 1) * 100
+            sym_data.append((symbol, gap_pct, price))
+
+        # Check earnings misses outside the lock — _check_earnings_miss acquires its own
+        # lock internally, so calling it inside _order_lock would deadlock.
+        sold_symbols: set[str] = set()
+        for symbol, gap_pct, price in sym_data:
+            if self._check_earnings_miss(symbol, gap_pct, price, "STARTUP"):
+                sold_symbols.add(symbol)
+
         with self._order_lock:
-            for symbol in self.config["watchlist"]:
+            for symbol, gap_pct, price in sym_data:
+                if symbol in sold_symbols:
+                    continue
                 if symbol in self._already_ordered or symbol in self._pending or symbol in held:
-                    continue
-                snap = snapshots.get(symbol)
-                latest = getattr(snap, "latest_trade", None) if snap else None
-                if not latest:
-                    continue
-                price = float(latest.price)
-                ref = self._reference_closes.get(symbol)
-                if not ref or ref <= 0:
-                    continue
-                gap_pct = ((price / ref) - 1) * 100
-                # Check earnings miss (negative gap) before buy logic
-                if self._check_earnings_miss(symbol, gap_pct, price, "STARTUP"):
                     continue
                 if gap_pct < self._min_gap or gap_pct > self._max_gap:
                     if abs(gap_pct) >= 1.0:
@@ -452,11 +519,9 @@ class SpikeStreamScanner:
         for symbol in symbols:
             if symbol in self._already_ordered:
                 continue
-            snap = snapshots.get(symbol)
-            latest = getattr(snap, "latest_trade", None) if snap else None
-            if not latest:
+            price = _best_price_from_snap(snapshots.get(symbol))
+            if price is None:
                 continue
-            price = float(latest.price)
             ref = self._reference_closes.get(symbol)
             if not ref or ref <= 0:
                 continue
@@ -536,11 +601,13 @@ class SpikeStreamScanner:
         if symbol in self._already_ordered:
             return
 
+        # Fetch held symbols outside the lock — occasional stale read is acceptable and
+        # far better than a blocking REST call that holds _order_lock for ~200ms.
+        held = self._get_held_symbols()
         to_order: list[tuple[str, float, float]] = []
         with self._order_lock:
             if symbol in self._already_ordered or symbol in self._pending:
                 return
-            held = self._get_held_symbols()
             if symbol in held:
                 self._already_ordered.add(symbol)
                 return
@@ -550,6 +617,37 @@ class SpikeStreamScanner:
             loop = asyncio.get_event_loop()
             for sym, gap, p in to_order:
                 await loop.run_in_executor(None, self._place_order, sym, gap, p)
+
+    # ── Earnings pending flusher ──────────────────────────────────────────────
+
+    async def _earnings_pending_flusher(self) -> None:
+        """Every 60s, force-flush earnings-day symbols stuck in _pending.
+
+        sector_confirm=3 is great for filtering noise, but a single stock reporting
+        a blowout quarter should not stay queued forever waiting for two more symbols
+        to gap.  Any symbol in _earnings_today that has been pending for >60s is
+        ordered immediately regardless of confirm count.
+        """
+        FLUSH_AFTER = 60.0
+        while True:
+            await asyncio.sleep(60)
+            to_order: list[tuple[str, float, float]] = []
+            now_ts = time.monotonic()
+            with self._order_lock:
+                for sym in list(self._pending):
+                    if sym not in self._earnings_today:
+                        continue
+                    if now_ts - self._pending_ts.get(sym, now_ts) < FLUSH_AFTER:
+                        continue
+                    gap_pct, price = self._pending.pop(sym)
+                    self._pending_ts.pop(sym, None)
+                    self._already_ordered.add(sym)
+                    to_order.append((sym, gap_pct, price))
+                    ts = datetime.now(MARKET_TZ).strftime("%H:%M:%S")
+                    print(f"[{ts}] EARNINGS-FLUSH {sym}: {gap_pct:+.2f}% "
+                          f"(sector confirm timeout — ordering without full confirm)")
+            for sym, gap, p in to_order:
+                self._place_order(sym, gap, p)
 
     # ── Entry point ───────────────────────────────────────────────────────────
 
@@ -592,7 +690,7 @@ class SpikeStreamScanner:
                 while True:
                     await asyncio.sleep(30)
                     now = datetime.now(MARKET_TZ)
-                    if now.hour >= 19 and now.minute >= 45:
+                    if (now.hour, now.minute) >= (19, 45):
                         print(f"[{now.strftime('%H:%M:%S')}] Extended-hours window closed (7:45pm) — stopping")
                         trade_stream.stop()
                         news_stream.stop()
@@ -613,12 +711,14 @@ class SpikeStreamScanner:
                     trade_stream._run_forever(),
                     news_stream._run_forever(),
                     _watchdog(),
+                    self._earnings_pending_flusher(),
                 )
             except Exception as exc:
                 log.warning("News stream error (%s) — continuing with trade stream only", exc)
                 await asyncio.gather(
                     trade_stream._run_forever(),
                     _watchdog(),
+                    self._earnings_pending_flusher(),
                 )
 
         try:

@@ -1,8 +1,10 @@
 alpaca:
   # Keep this true until you have tested the script over many market days.
   paper: true
-  # IEX is available on free paper accounts. SIP usually requires a paid data plan.
-  data_feed: iex
+  # SIP covers all ECN/exchange trades including pre-market (4AM-9:30AM).
+  # IEX only covers ~2% of pre-market volume — use sip for the spike stream.
+  # Alpaca paper accounts include SIP at no cost; live accounts need a paid plan.
+  data_feed: sip
 
 watchlist:
   # Pure semiconductor and semiconductor-adjacent hardware only.
