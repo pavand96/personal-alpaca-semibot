@@ -2,7 +2,7 @@
 # Real-time extended-hours spike detector.
 #
 # Usage: run_spike.sh [premarket|afterhours]
-#   premarket  — started at 4:00 AM ET; stream exits when market opens at 9:30 AM
+#   premarket  — started at 3:45 AM ET; 15 min warmup before pre-market opens at 4:00 AM
 #   afterhours — started at 4:15 PM ET; stream exits at 7:45 PM ET
 #
 # Phase 1 — dry-run observation:  2026-05-08 → 2026-06-05  (20 trading days)

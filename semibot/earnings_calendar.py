@@ -12,10 +12,18 @@ daily signal log so there are no surprises at 4 AM.
 from __future__ import annotations
 
 import logging
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 log = logging.getLogger(__name__)
+
+_ET = ZoneInfo("America/New_York")
+
+
+def _today_et() -> date:
+    """Today's date in Eastern Time — correct regardless of machine TZ setting."""
+    return datetime.now(_ET).date()
 
 
 def fetch_earnings_calendar(
@@ -33,7 +41,7 @@ def fetch_earnings_calendar(
         log.warning("yfinance not installed — earnings calendar unavailable. Run: pip install yfinance")
         return {}
 
-    today = date.today()
+    today = _today_et()
     cutoff = today + timedelta(days=lookahead_days)
     result: dict[str, date] = {}
 
@@ -59,7 +67,7 @@ def fetch_earnings_calendar(
 def get_reporting_today(symbols: list[str]) -> list[str]:
     """Return symbols with earnings scheduled today."""
     cal = fetch_earnings_calendar(symbols, lookahead_days=0)
-    today = date.today()
+    today = _today_et()
     return [s for s, d in cal.items() if d == today]
 
 
@@ -71,7 +79,7 @@ def get_reporting_soon(symbols: list[str], days: int = 7) -> dict[str, date]:
 def print_earnings_schedule(symbols: list[str], days: int = 14) -> None:
     """Print a formatted upcoming earnings schedule for all watchlist symbols."""
     cal = fetch_earnings_calendar(symbols, lookahead_days=days)
-    today = date.today()
+    today = _today_et()
     if not cal:
         print(f"  No earnings scheduled in next {days} days for watched symbols")
         return
@@ -89,13 +97,13 @@ def enrich_signals_with_calendar(
 ) -> dict[str, dict]:
     """Add or update earnings_date field in the signals dict from the calendar."""
     cal = fetch_earnings_calendar(symbols, lookahead_days=days)
-    today = date.today()
+    today = _today_et()
     enriched = dict(signals)
     for sym, d in cal.items():
         days_away = (d - today).days
         entry = enriched.setdefault(sym, {
             "headline": f"Earnings scheduled {d}",
-            "detected_at": __import__("datetime").datetime.now(__import__("datetime").UTC).isoformat(),
+            "detected_at": datetime.now(UTC).isoformat(),
             "catalyst_type": "earnings_scheduled",
             "keywords": ["earnings"],
             "score": 3 if days_away == 0 else 2,

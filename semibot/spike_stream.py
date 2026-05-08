@@ -29,14 +29,14 @@ import asyncio
 import logging
 import threading
 import time
-from datetime import UTC, datetime, timedelta
+from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from alpaca.data.enums import DataFeed
-from alpaca.data.historical import NewsClient, StockHistoricalDataClient
+from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.live import NewsDataStream, StockDataStream
-from alpaca.data.requests import NewsRequest, StockSnapshotRequest
+from alpaca.data.requests import StockSnapshotRequest
 
 from semibot.bot import SemiMomentumBot, floor_order_qty, limit_price_for_side
 from semibot.events import append_event
@@ -573,7 +573,7 @@ class SpikeStreamScanner:
         headline_preview = (getattr(news, "headline", "") or "")[:90]
         print(f"[{ts}] NEWS [{', '.join(relevant)}]: {headline_preview}")
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._check_news_gaps, relevant, text)
 
     # ── Layer 3: trade WebSocket ──────────────────────────────────────────────
@@ -591,8 +591,7 @@ class SpikeStreamScanner:
 
         # Check earnings miss (negative gap) before buy logic
         if self._check_earnings_miss(symbol, gap_pct, price, "TRADE"):
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, lambda: None)  # yield to event loop
+            await asyncio.sleep(0)  # yield to event loop
             return
 
         if gap_pct < self._min_gap or gap_pct > self._max_gap:
@@ -614,7 +613,7 @@ class SpikeStreamScanner:
             to_order = self._try_queue_or_flush(symbol, gap_pct, price, "TRADE")
 
         if to_order:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             for sym, gap, p in to_order:
                 await loop.run_in_executor(None, self._place_order, sym, gap, p)
 
