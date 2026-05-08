@@ -188,8 +188,6 @@ class SpikeStreamScanner:
         self._pending_ts: dict[str, float] = {}             # symbol → monotonic time of entry
         self._order_lock = threading.Lock()
         self._earnings_symbols: set[str] = set()
-        # Per-symbol bypass gap threshold — lowered for high-score pre-detected signals
-        self._bypass_gap_by_symbol: dict[str, float] = {}
         # Symbols with earnings TODAY — bidirectional (buy beat, sell miss)
         self._earnings_today: set[str] = set()
         # Held-symbols REST cache (refreshed at most every 30s)
@@ -219,12 +217,15 @@ class SpikeStreamScanner:
             print(f"  No earnings in next {lookahead} days")
 
     def load_earnings_symbols(self) -> None:
-        """Load catalyst signals: pre-detected signals file first, then fresh 24h news scan.
+        """Load catalyst signals for notional boost context.
 
-        Pre-detected signals (written by the news monitor cron) are merged with a
-        fresh 24h news fetch so the stream starts with the richest possible context.
-        High-score signals (earnings score >= 4) lower the bypass threshold so even
-        a 6% gap triggers an immediate order without waiting for sector confirmation.
+        News signals mark which symbols have recent catalyst headlines.  They are
+        used ONLY to boost notional size (earnings_notional_multiplier) — not to
+        lower bypass thresholds or skip sector confirmation.
+
+        Bypass of sector confirmation is driven exclusively by the calendar
+        (_earnings_today), not by news keywords.  A headline can look bullish but
+        already be priced in; the gap price is the only reliable signal.
         """
         from semibot.news_monitor import load_signals_file, scan_news
 
@@ -237,8 +238,7 @@ class SpikeStreamScanner:
             print(f"Pre-detected signals from monitor ({len(pre_signals)}): "
                   f"{', '.join(sorted(pre_signals))}")
             for sym, sig in sorted(pre_signals.items(), key=lambda x: -x[1].get("score", 0)):
-                bypass_note = "  [BYPASS]" if sig.get("bypass_confirm") else ""
-                print(f"  {sym:6}  score={sig.get('score', '?')}  {sig.get('headline', '')[:65]}{bypass_note}")
+                print(f"  {sym:6}  score={sig.get('score', '?')}  {sig.get('headline', '')[:70]}")
 
         # 2. Fresh 24h news scan to catch anything missed between cron runs
         try:
@@ -247,31 +247,12 @@ class SpikeStreamScanner:
             log.warning("Fresh news scan failed: %s", exc)
             fresh = {}
 
-        # Merge: pre-detected + fresh; fresh overwrites for the same symbol
         merged = {**pre_signals, **fresh}
+        self._earnings_symbols = set(merged)
 
-        found: set[str] = set()
-        bypass_overrides: dict[str, float] = {}
-        for sym, sig in merged.items():
-            found.add(sym)
-            score = int(sig.get("score", 1))
-            bypass_confirm = bool(sig.get("bypass_confirm", False))
-            # High-confidence earnings (score >= 4): lower bypass gap to 6%
-            if bypass_confirm and score >= 4:
-                bypass_overrides[sym] = 6.0
-            # Standard earnings: use configured threshold
-            elif bypass_confirm:
-                bypass_overrides[sym] = self._earnings_bypass_gap
-
-        self._earnings_symbols = found
-        self._bypass_gap_by_symbol = bypass_overrides
-
-        if found:
-            print(f"Catalyst signals active (notional ×{self._earnings_multiplier:.1f}): "
-                  f"{', '.join(sorted(found))}")
-            if bypass_overrides:
-                for sym, thresh in sorted(bypass_overrides.items()):
-                    print(f"  {sym}: bypass at ≥{thresh:.0f}% gap")
+        if self._earnings_symbols:
+            print(f"Catalyst context loaded for notional boost (×{self._earnings_multiplier:.1f}): "
+                  f"{', '.join(sorted(self._earnings_symbols))}")
         else:
             print("No catalyst signals detected")
 
@@ -501,8 +482,13 @@ class SpikeStreamScanner:
     # ── Layer 2: news WebSocket ───────────────────────────────────────────────
 
     def _check_news_gaps(self, symbols: list[str], news_text: str) -> None:
-        """Snapshot news-mentioned symbols and fire/queue immediately.  Runs in a thread."""
-        is_earnings = any(kw in news_text for kw in _EARNINGS_KEYWORDS)
+        """Snapshot news-mentioned symbols and fire/queue immediately.  Runs in a thread.
+
+        News is used as an attention trigger — it tells us to look at a symbol NOW.
+        The actual buy/sell decision is based on the gap (price), not the headline text.
+        Bypass of sector confirmation is granted only when the earnings calendar confirms
+        the symbol is reporting today AND the gap is large.  Keywords alone are not enough.
+        """
         try:
             client = StockHistoricalDataClient(api_key=self.api_key, secret_key=self.secret_key)
             snapshots = client.get_stock_snapshot(
@@ -533,9 +519,10 @@ class SpikeStreamScanner:
                 continue
 
             ts = datetime.now(MARKET_TZ).strftime("%H:%M:%S")
-            # Per-symbol bypass threshold: lowered for high-score pre-detected signals
-            bypass_gap = self._bypass_gap_by_symbol.get(symbol, self._earnings_bypass_gap)
-            bypass = is_earnings and gap_pct >= bypass_gap
+            # Bypass sector confirmation only when the calendar confirms earnings today
+            # AND the gap is large.  Headline keywords are NOT sufficient — a bullish
+            # headline can be fully priced in or misleading.
+            bypass = symbol in self._earnings_today and gap_pct >= self._earnings_bypass_gap
             to_order: list[tuple[str, float, float]] = []
 
             with self._order_lock:
@@ -545,7 +532,8 @@ class SpikeStreamScanner:
                     self._already_ordered.add(symbol)
                     continue
                 if bypass:
-                    print(f"[{ts}] NEWS BYPASS {symbol}: {gap_pct:+.2f}% (earnings ≥{bypass_gap:.0f}% → no sector confirm)")
+                    print(f"[{ts}] NEWS BYPASS {symbol}: {gap_pct:+.2f}% "
+                          f"(earnings today + gap ≥{self._earnings_bypass_gap:.0f}% → no sector confirm)")
                     self._already_ordered.add(symbol)
                     to_order.append((symbol, gap_pct, price))
                 else:

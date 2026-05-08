@@ -243,31 +243,39 @@ news_hold:
   # true: block the buy if the news API is unavailable (safer for live trading).
   # false: allow buys when news data cannot be fetched (backtest-compatible default).
   fail_closed: false
+  # Hard blockers only — serious negative events with reliable price impact.
+  # Positive news is NOT used here; it is too noisy and often already priced in.
   block_keywords:
     - accounting probe
     - bankruptcy
     - class action
+    - criminal
     - cuts guidance
     - data breach
     - delisting
     - downgrade
+    - earnings miss
     - fraud
+    - going concern
     - guidance cut
+    - indicted
     - investigation
     - lawsuit
     - misses estimates
     - probe
+    - restatement
     - recall
     - resigns
     - sec investigation
     - short report
     - slashes forecast
     - subpoena
+    - whistleblower
 
 buzz_earnings_overlay:
-  # Optional overlay used by adaptive-semis-backtest. It boosts confirmed
-  # momentum names with positive news buzz and blocks weak/negative news or
-  # dangerous earnings-window setups. Missing news/earnings data fails open.
+  # News is a brake, not an accelerator. Negative signals block trades; positive
+  # signals provide only a marginal ranking boost (a bullish headline may already
+  # be fully priced in by the time the bot runs).
   enabled: true
   fail_open: true
   news_enabled: true
@@ -275,12 +283,12 @@ buzz_earnings_overlay:
   news_fetch_chunk_days: 30
   news_limit_per_request: 50
   article_count_cap: 5
-  article_weight: 0.4
-  positive_keyword_weight: 1.0
-  negative_keyword_weight: 2.0
+  article_weight: 0.2          # was 0.4 — reduced; article volume is a weak signal
+  positive_keyword_weight: 0.3  # was 1.0 — minimal boost; positive news is often priced in
+  negative_keyword_weight: 3.0  # was 2.0 — stronger block; negative news is more reliable
   score_weight: 2.0
-  max_score_boost: 20.0
-  negative_score_block_threshold: -3.0
+  max_score_boost: 6.0          # was 20.0 — cap upside influence; downside has no cap
+  negative_score_block_threshold: -2.0  # was -3.0 — block earlier on negative signals
   earnings_calendar_file: data/earnings_calendar.csv
   block_new_entries_near_earnings: true
   earnings_avoid_days_before: 2
