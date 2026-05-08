@@ -158,6 +158,8 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
         bull_exposure_pct = float(settings.get("bull_exposure_pct", 0.0))
         bull_max_symbols = int(settings.get("bull_max_symbols", max_symbols))
         bull_sector_min_return = float(settings.get("bull_sector_min_return_pct", 0.0))
+        bull_sector_fast_lookback = int(settings.get("bull_sector_fast_lookback_days", 5))
+        bull_sector_fast_min_return = float(settings.get("bull_sector_fast_min_return_pct", -999.0))
         atr_sizing_enabled = bool(settings.get("atr_sizing_enabled", False))
         atr_lookback_days = int(settings.get("atr_lookback_days", 14))
         breadth_filter_enabled = bool(settings.get("breadth_filter_enabled", False))
@@ -246,11 +248,13 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
             settings=overlay_settings,
         )
         bear_blocked = regime_filter_enabled and regime == MarketRegime.BEAR and bear_block_entries
+        sector_fast_return = sector_return_pct(bars_by_symbol, current_date, bull_sector_fast_lookback)
         live_use_full_bull = (
             regime_filter_enabled
             and regime == MarketRegime.BULL
             and bull_exposure_pct > 0
             and sector_return >= bull_sector_min_return
+            and sector_fast_return >= bull_sector_fast_min_return
         )
         effective_max_symbols_live = bull_max_symbols if live_use_full_bull else max_symbols
         selected = [] if (risk_off or bear_blocked) else candidates[:effective_max_symbols_live]
@@ -404,6 +408,8 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
         bull_max_symbols = int(settings.get("bull_max_symbols", max_symbols))
         rebalance_days_bull = int(settings.get("rebalance_days_bull", rebalance_days))
         bull_sector_min_return = float(settings.get("bull_sector_min_return_pct", 0.0))
+        bull_sector_fast_lookback = int(settings.get("bull_sector_fast_lookback_days", 5))
+        bull_sector_fast_min_return = float(settings.get("bull_sector_fast_min_return_pct", -999.0))
         bull_drawdown_cap = float(settings.get("bull_drawdown_cap_pct", 0.0)) / 100
         atr_sizing_enabled = bool(settings.get("atr_sizing_enabled", False))
         atr_lookback_days = int(settings.get("atr_lookback_days", 14))
@@ -511,11 +517,13 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
             current_equity = cash + market_value(positions, today_bars)
             portfolio_dd = (current_equity / peak_equity - 1) if peak_equity > 0 else 0.0
             drawdown_breaker_tripped = bull_drawdown_cap > 0 and portfolio_dd <= -bull_drawdown_cap
+            sector_fast_return = sector_return_pct(bars_by_symbol, current_date, bull_sector_fast_lookback)
             use_full_bull = (
                 regime_filter_enabled
                 and regime == MarketRegime.BULL
                 and bull_exposure_pct > 0
                 and sector_return >= bull_sector_min_return
+                and sector_fast_return >= bull_sector_fast_min_return
                 and not drawdown_breaker_tripped
             )
             effective_rebalance_days = rebalance_days_bull if use_full_bull else rebalance_days
@@ -748,8 +756,19 @@ def rank_adaptive_candidates(
         avg_volume = sum(bar.volume for bar in prior[-20:]) / 20
         volume_ratio = latest.volume / avg_volume if avg_volume > 0 else 1.0
 
+        # 52-week high proximity: stocks near/at new highs continue to outperform
+        lookback_high = max(b.close for b in prior[-min(252, len(prior)):])
+        high_proximity = latest.close / lookback_high if lookback_high > 0 else 1.0
+
         # Base score: slow momentum + fast momentum + volume confirmation + sector tailwind
-        score = slow_return * 0.9 + fast_return * 1.8 + min(volume_ratio, 3.0) * 2.0 + sector_return * 0.5
+        # + bonus for being near 52-week high (strong momentum continuation signal)
+        score = (
+            slow_return * 0.9
+            + fast_return * 1.8
+            + min(volume_ratio, 3.0) * 2.0
+            + sector_return * 0.5
+            + (high_proximity - 0.8) * 15.0
+        )
 
         # SMA alignment: stacked SMAs (price > SMA20 > SMA50) signal a confirmed uptrend
         sma_alignment = 0.0
