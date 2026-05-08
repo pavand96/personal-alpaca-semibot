@@ -1,0 +1,5 @@
+CRON_TZ=America/New_York
+# Start after-hours spike scanner at 4:15 PM ET on weekdays.
+# Scans every 5 minutes for symbols spiking >= afterhours_min_gap_pct vs today's 4pm close.
+# Places extended-hours limit orders immediately; loop exits automatically at 7:45pm ET.
+15 16 * * 1-5 /home/pavand96/personal-alpaca-semibot/scripts/run_afterhours.sh >> /home/pavand96/personal-alpaca-semibot/logs/afterhours.log 2>&1

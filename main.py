@@ -57,7 +57,11 @@ _DATE_REQUIRED_COMMANDS = frozenset([
 ])
 
 _ALL_COMMANDS = sorted(
-    _DATE_REQUIRED_COMMANDS | {"monitor", "trade-once", "run", "ml-signal", "ml-trade-once", "premarket-run", "premarket-trade"}
+    _DATE_REQUIRED_COMMANDS | {
+        "monitor", "trade-once", "run", "ml-signal", "ml-trade-once",
+        "premarket-run", "premarket-trade",
+        "afterhours-run", "afterhours-trade",
+    }
 )
 
 
@@ -186,6 +190,28 @@ def main() -> None:
     def cmd_trade_once() -> None:
         AdaptiveSemiPortfolioBacktester(config, api_key=api_key, secret_key=secret_key).trade_once(execute=args.execute)
 
+    def cmd_afterhours_trade() -> None:
+        AdaptiveSemiPortfolioBacktester(config, api_key=api_key, secret_key=secret_key).afterhours_scan(execute=args.execute)
+
+    def cmd_afterhours_run() -> None:
+        """Scan for after-hours spikes every N minutes between 4:15pm and 7:45pm ET."""
+        bot = AdaptiveSemiPortfolioBacktester(config, api_key=api_key, secret_key=secret_key)
+        interval = int(config["runtime"].get("afterhours_interval_seconds", 300))
+        AH_CLOSE_HOUR, AH_CLOSE_MIN = 19, 45  # 7:45pm ET — Alpaca extended hours end at 8pm
+        from zoneinfo import ZoneInfo
+        MARKET_TZ = ZoneInfo("America/New_York")
+        while True:
+            now = __import__("datetime").datetime.now(MARKET_TZ)
+            if now.hour > AH_CLOSE_HOUR or (now.hour == AH_CLOSE_HOUR and now.minute >= AH_CLOSE_MIN):
+                print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} after-hours window closed — exiting loop")
+                break
+            print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} after-hours spike scan")
+            try:
+                bot.afterhours_scan(execute=args.execute)
+            except Exception as exc:
+                print(f"After-hours scan error: {exc}")
+            time.sleep(interval)
+
     def cmd_premarket_trade() -> None:
         AdaptiveSemiPortfolioBacktester(config, api_key=api_key, secret_key=secret_key).trade_once(execute=args.execute, premarket=True)
 
@@ -236,6 +262,8 @@ def main() -> None:
         "trade-once": cmd_trade_once,
         "premarket-trade": cmd_premarket_trade,
         "premarket-run": cmd_premarket_run,
+        "afterhours-trade": cmd_afterhours_trade,
+        "afterhours-run": cmd_afterhours_run,
         "run": cmd_run,
     }
     commands[args.command]()

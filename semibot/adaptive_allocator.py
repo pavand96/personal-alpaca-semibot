@@ -80,6 +80,59 @@ class BuzzSnapshot:
 
 
 class AdaptiveSemiPortfolioBacktester(Backtester):
+    def afterhours_scan(self, execute: bool = False) -> list[Decision]:
+        """Detect after-hours spikes and immediately place extended-hours limit orders."""
+        bot = SemiMomentumBot(self.config, api_key=self.api_key, secret_key=self.secret_key)
+        bot.assert_account_can_trade()
+        clock = bot.trading.get_clock()  # type: ignore[union-attr]
+        if bool(getattr(clock, "is_open", False)):
+            print("Market is open — use regular 'run' command for intraday trading.")
+            return []
+
+        settings = self.config["adaptive_semis_allocator"]
+        min_gap = float(settings.get("afterhours_min_gap_pct", 3.0))
+        max_gap = float(settings.get("afterhours_max_gap_pct", 20.0))
+        notional = float(settings.get("afterhours_notional_per_trade", 1000.0))
+
+        gaps = fetch_afterhours_gaps(bot, self.config["watchlist"])
+        if not gaps:
+            print("No after-hours price data available.")
+            return []
+
+        # Log all symbols with meaningful after-hours moves
+        for sym, pct in sorted(gaps.items(), key=lambda x: -abs(x[1])):
+            if abs(pct) >= 1.0:
+                print(f"  AH {sym:6} {pct:+.1f}%")
+
+        qualifying = {s: g for s, g in gaps.items() if min_gap <= g <= max_gap}
+        if not qualifying:
+            print(f"No after-hours spikes >= {min_gap:.1f}% (max watched: {max(gaps.values(), default=0):.1f}%)")
+            return []
+
+        positions = bot.get_positions()
+        held = {s for s, p in positions.items() if float(getattr(p, "qty", 0)) > 0}
+
+        decisions: list[Decision] = []
+        for symbol, gap_pct in sorted(qualifying.items(), key=lambda x: -x[1]):
+            if symbol in held:
+                print(f"  SKIP {symbol}: already held")
+                continue
+            print(f"  SPIKE {symbol}: after-hours gap={gap_pct:+.1f}% — queuing extended-hours buy")
+            decisions.append(
+                Decision(symbol, "buy", f"afterhours spike gap={gap_pct:+.1f}%", notional=notional)
+            )
+
+        submitted = submit_adaptive_decisions(
+            bot=bot,
+            decisions=decisions,
+            dry_run=bool(self.config["risk"]["dry_run"]) or not execute,
+            max_orders=int(self.config["risk"]["max_orders_per_run"]),
+            extended_hours=True,
+        )
+        if not submitted:
+            print("No after-hours orders placed.")
+        return submitted
+
     def trade_once(self, execute: bool = False, premarket: bool = False) -> list[Decision]:
         bot = SemiMomentumBot(self.config, api_key=self.api_key, secret_key=self.secret_key)
         bot.assert_account_can_trade()
@@ -1335,6 +1388,38 @@ def _compute_gap_by_symbol(
         prev_close = hist[-1].close
         if prev_close > 0:
             gaps[symbol] = ((price / prev_close) - 1) * 100
+    return gaps
+
+
+def fetch_afterhours_gaps(bot: SemiMomentumBot, symbols: list[str]) -> dict[str, float]:
+    """Return after-hours gap pct = (latest_trade / today_regular_close) - 1 for each symbol.
+
+    Uses snapshot.daily_bar.close as the regular-session close reference so the gap
+    reflects the move that happened AFTER the 4pm close, not vs yesterday.
+    Falls back to previous_daily_bar.close if daily_bar is unavailable (pre-market case).
+    """
+    snapshots = bot.data.get_stock_snapshot(
+        StockSnapshotRequest(symbol_or_symbols=symbols, feed=bot.feed)
+    )
+    gaps: dict[str, float] = {}
+    for symbol in symbols:
+        snapshot = snapshots.get(symbol)
+        if not snapshot:
+            continue
+        latest = getattr(snapshot, "latest_trade", None)
+        if not latest:
+            continue
+        price = float(latest.price)
+        # Prefer today's regular-session close; fall back to previous day's close
+        day_bar = getattr(snapshot, "daily_bar", None)
+        prev_bar = getattr(snapshot, "previous_daily_bar", None)
+        reference = None
+        if day_bar and getattr(day_bar, "close", None):
+            reference = float(day_bar.close)
+        elif prev_bar and getattr(prev_bar, "close", None):
+            reference = float(prev_bar.close)
+        if reference and reference > 0:
+            gaps[symbol] = ((price / reference) - 1) * 100
     return gaps
 
 
