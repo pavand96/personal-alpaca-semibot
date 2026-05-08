@@ -419,6 +419,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "retain_min_fast_momentum_pct": -3.0,
         "retain_min_slow_momentum_pct": 5.0,
         "trailing_stop_pct": 13.0,
+        "trailing_stop_pct_bull": 17.0,
+        "trailing_wide_min_profit_pct": 12.0,
         "hard_stop_pct": 12.0,
         "regime_filter_enabled": True,
         "regime_sma_fast_days": 50,

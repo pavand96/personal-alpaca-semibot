@@ -356,6 +356,8 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
         retain_min_slow_momentum_pct = float(settings["retain_min_slow_momentum_pct"])
         trailing_stop_pct = float(settings["trailing_stop_pct"]) / 100
         hard_stop_pct = float(settings["hard_stop_pct"]) / 100
+        trailing_stop_pct_bull = float(settings.get("trailing_stop_pct_bull", settings["trailing_stop_pct"])) / 100
+        trailing_wide_min_profit = float(settings.get("trailing_wide_min_profit_pct", 8.0)) / 100
         slippage_bps = float(self.config["backtest"]["slippage_bps"])
         regime_filter_enabled = bool(settings.get("regime_filter_enabled", False))
         regime_sma_fast = int(settings.get("regime_sma_fast_days", 50))
@@ -426,7 +428,15 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
                     continue
                 bar = today_bars[symbol]
                 hard_stop_price = position.avg_entry * (1 - hard_stop_pct)
-                trailing_stop_price = position.peak_price * (1 - trailing_stop_pct)
+                # Widen trailing stop in BULL regime once position has earned a profit cushion
+                unrealized_pct = (bar.open / position.avg_entry - 1) if position.avg_entry > 0 else 0.0
+                in_bull = regime_filter_enabled and regime == MarketRegime.BULL
+                effective_trailing = (
+                    trailing_stop_pct_bull
+                    if in_bull and unrealized_pct >= trailing_wide_min_profit
+                    else trailing_stop_pct
+                )
+                trailing_stop_price = position.peak_price * (1 - effective_trailing)
                 stop_price = max(hard_stop_price, trailing_stop_price)
                 if bar.open <= stop_price:
                     cash = sell_position(
