@@ -1,6 +1,12 @@
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 
-from semibot.adaptive_allocator import AdaptiveCandidate, apply_buzz_earnings_overlay, should_retain_winner
+from semibot.adaptive_allocator import (
+    AdaptiveCandidate,
+    apply_buzz_earnings_overlay,
+    detect_rebound_context,
+    rank_rebound_candidates,
+    should_retain_winner,
+)
 from semibot.backtest import BacktestPosition, DailyBar
 
 
@@ -14,6 +20,22 @@ def _bar(symbol: str, close: float = 100.0) -> DailyBar:
         close=close,
         volume=1_000_000,
     )
+
+
+def _series(symbol: str, closes: list[float]) -> list[DailyBar]:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    return [
+        DailyBar(
+            symbol=symbol,
+            timestamp=start + timedelta(days=index),
+            open=close,
+            high=close,
+            low=close,
+            close=close,
+            volume=1_000_000 + index,
+        )
+        for index, close in enumerate(closes)
+    ]
 
 
 def _candidate(symbol: str, score: float) -> AdaptiveCandidate:
@@ -151,3 +173,46 @@ def test_should_retain_winner_when_profit_and_momentum_hold() -> None:
         min_fast_momentum_pct=-3.0,
         min_slow_momentum_pct=5.0,
     )
+
+
+def test_rebound_context_activates_after_deep_drawdown_and_repair() -> None:
+    closes = [100.0] * 20 + [120.0] * 30 + [90.0, 88.0, 87.0, 89.0, 92.0, 95.0]
+    settings = {
+        "rebound_mode_enabled": True,
+        "sector_drawdown_lookback_days": 30,
+        "rebound_fast_lookback_days": 3,
+        "rebound_trigger_drawdown_pct": -15.0,
+        "rebound_min_sector_fast_return_pct": 3.0,
+        "rebound_min_market_fast_return_pct": 0.5,
+        "rebound_breadth_sma_days": 5,
+        "rebound_min_breadth_pct": 0.5,
+    }
+
+    context = detect_rebound_context(
+        bars_by_symbol={"NVDA": _series("NVDA", closes), "AMD": _series("AMD", closes)},
+        risk_bars_by_symbol={"QQQ": _series("QQQ", [100.0] * 53 + [101.0, 102.0, 103.0])},
+        current_date=date(2026, 2, 26),
+        settings=settings,
+    )
+
+    assert context.active is True
+    assert "rebound active" in context.reason
+
+
+def test_rebound_candidates_rank_short_term_velocity() -> None:
+    weak = [100.0] * 65 + [90.0, 91.0, 92.0, 93.0]
+    strong = [100.0] * 65 + [80.0, 85.0, 90.0, 95.0]
+    settings = {
+        "rebound_symbol_lookback_days": 3,
+        "rebound_min_symbol_return_pct": 2.0,
+        "rebound_volume_weight": 2.0,
+        "rebound_drawdown_weight": 0.25,
+    }
+
+    candidates = rank_rebound_candidates(
+        bars_by_symbol={"WEAK": _series("WEAK", weak), "STRONG": _series("STRONG", strong)},
+        current_date=date(2026, 3, 11),
+        settings=settings,
+    )
+
+    assert [candidate.symbol for candidate in candidates] == ["STRONG", "WEAK"]

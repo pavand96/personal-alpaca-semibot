@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import csv
+import logging
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
+
+log = logging.getLogger(__name__)
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -79,6 +82,16 @@ class BuzzSnapshot:
     score: float
 
 
+@dataclass(frozen=True)
+class ReboundContext:
+    active: bool
+    sector_drawdown_pct: float
+    sector_fast_return_pct: float
+    market_fast_return_pct: float
+    short_breadth_pct: float
+    reason: str
+
+
 class AdaptiveSemiPortfolioBacktester(Backtester):
     def spike_scan(self, execute: bool = False, already_ordered: set[str] | None = None) -> tuple[list[Decision], set[str]]:
         """Detect pre-market or after-hours spikes and immediately place extended-hours limit orders.
@@ -96,15 +109,19 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
 
         bot = SemiMomentumBot(self.config, api_key=self.api_key, secret_key=self.secret_key)
         bot.assert_account_can_trade()
-        clock = bot.trading.get_clock()  # type: ignore[union-attr]
+        clock = bot.trading.get_clock()
         if bool(getattr(clock, "is_open", False)):
             print("Market is open — use regular 'run' command for intraday trading.")
             return [], already_ordered
 
+        from semibot.spike_tracker import record_spike_entry
+
         settings = self.config["adaptive_semis_allocator"]
-        min_gap = float(settings.get("spike_min_gap_pct", 3.0))
+        min_gap = float(settings.get("spike_min_gap_pct", 5.0))
         max_gap = float(settings.get("spike_max_gap_pct", 20.0))
         notional = float(settings.get("spike_notional_per_trade", 1000.0))
+        sector_confirm = int(settings.get("spike_sector_confirm", 1))
+        tracker_path = str(settings.get("spike_tracker_path", "logs/spike_tracker.json"))
 
         gaps = fetch_extended_hours_gaps(bot, self.config["watchlist"])
         if not gaps:
@@ -122,8 +139,13 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
             print(f"No spikes >= {min_gap:.1f}% (best: {top:+.1f}%)")
             return [], already_ordered
 
+        if len(qualifying) < sector_confirm:
+            print(f"Only {len(qualifying)} symbol(s) gapping — need {sector_confirm} for sector confirmation. Skipping.")
+            return [], already_ordered
+
         positions = bot.get_positions()
         held = {s for s, p in positions.items() if float(getattr(p, "qty", 0)) > 0}
+        live_prices = fetch_live_prices(bot, list(qualifying.keys()))
 
         decisions: list[Decision] = []
         for symbol, gap_pct in sorted(qualifying.items(), key=lambda x: -x[1]):
@@ -138,15 +160,24 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
                 Decision(symbol, "buy", f"spike gap={gap_pct:+.1f}%", notional=notional)
             )
 
+        dry_run = bool(self.config["risk"]["dry_run"]) or not execute
         submitted = submit_adaptive_decisions(
             bot=bot,
             decisions=decisions,
-            dry_run=bool(self.config["risk"]["dry_run"]) or not execute,
+            dry_run=dry_run,
             max_orders=int(self.config["risk"]["max_orders_per_run"]),
             extended_hours=True,
         )
         if decisions and not submitted:
             print("No spike orders placed.")
+        if not dry_run:
+            for decision in submitted:
+                if decision.action == "buy":
+                    entry_price = live_prices.get(decision.symbol, 0.0)
+                    try:
+                        record_spike_entry(tracker_path, decision.symbol, qualifying[decision.symbol], entry_price)
+                    except Exception as exc:
+                        log.warning("spike_tracker record failed for %s: %s", decision.symbol, exc)
         return submitted, already_ordered
 
     # backward-compat alias
@@ -157,7 +188,7 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
     def trade_once(self, execute: bool = False, premarket: bool = False) -> list[Decision]:
         bot = SemiMomentumBot(self.config, api_key=self.api_key, secret_key=self.secret_key)
         bot.assert_account_can_trade()
-        clock = bot.trading.get_clock()  # type: ignore[union-attr]
+        clock = bot.trading.get_clock()
         market_open = bool(getattr(clock, "is_open", False))
         if not premarket and self.config["risk"]["require_market_open"] and not market_open:
             print("Market is closed. No adaptive orders submitted.")
@@ -268,6 +299,9 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
             symbol_sma_filter_days,
             atr_lookback_days + 1,
             breadth_sma_days if breadth_filter_enabled else 0,
+            int(settings.get("rebound_fast_lookback_days", 5)) if settings.get("rebound_mode_enabled", False) else 0,
+            int(settings.get("rebound_breadth_sma_days", 5)) if settings.get("rebound_mode_enabled", False) else 0,
+            int(settings.get("rebound_symbol_lookback_days", 3)) if settings.get("rebound_mode_enabled", False) else 0,
             50,
             30,
         )
@@ -314,6 +348,7 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
             if regime_filter_enabled
             else MarketRegime.BULL
         )
+        rebound = detect_rebound_context(bars_by_symbol, risk_bars_by_symbol, current_date, settings)
 
         candidates = rank_adaptive_candidates(
             bars_by_symbol=bars_by_symbol,
@@ -359,28 +394,54 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
             and sector_return >= bull_sector_min_return
             and sector_fast_return >= bull_sector_fast_min_return
         )
-        effective_max_symbols_live = bull_max_symbols if live_use_full_bull else max_symbols
-        selected = [] if (risk_off or bear_blocked) else candidates[:effective_max_symbols_live]
+        if rebound.active:
+            rebound_candidates = rank_rebound_candidates(bars_by_symbol, current_date, settings)
+            rebound_candidates = apply_buzz_earnings_overlay(
+                candidates=rebound_candidates,
+                current_date=current_date,
+                positions=overlay_positions,
+                today_bars=overlay_bars,
+                news_by_symbol=news_by_symbol,
+                earnings_by_symbol=earnings_by_symbol,
+                settings=overlay_settings,
+            )
+            effective_max_symbols_live = int(settings.get("rebound_max_symbols", max_symbols))
+            selected = rebound_candidates[:effective_max_symbols_live]
+        else:
+            effective_max_symbols_live = bull_max_symbols if live_use_full_bull else max_symbols
+            selected = [] if (risk_off or bear_blocked) else candidates[:effective_max_symbols_live]
         target_symbols = {candidate.symbol for candidate in selected}
+
+        from semibot.spike_tracker import get_symbols_to_exit, remove_spike_entry
+        tracker_path = str(settings.get("spike_tracker_path", "logs/spike_tracker.json"))
+        spike_exit_symbols = set(get_symbols_to_exit(tracker_path, current_date))
 
         decisions: list[Decision] = []
         held_symbols = set()
         for symbol in self.config["watchlist"]:
             position = positions.get(symbol)
             if not position:
+                if symbol in spike_exit_symbols:
+                    remove_spike_entry(tracker_path, symbol)  # stale — position already gone
                 continue
             qty = float(getattr(position, "qty", 0.0) or 0.0)
             if qty <= 0:
+                if symbol in spike_exit_symbols:
+                    remove_spike_entry(tracker_path, symbol)
                 continue
             held_symbols.add(symbol)
             current_price = latest_prices.get(symbol)
             unrealized_plpc = float(getattr(position, "unrealized_plpc", 0.0) or 0.0)
             if unrealized_plpc <= -(hard_stop_pct / 100):
+                if symbol in spike_exit_symbols:
+                    remove_spike_entry(tracker_path, symbol)
                 decisions.append(
                     Decision(symbol, "sell", f"adaptive hard stop {unrealized_plpc:.2%} <= -{hard_stop_pct:.2f}%", qty=qty)
                 )
                 continue
-            if risk_off:
+            if risk_off and not rebound.active:
+                if symbol in spike_exit_symbols:
+                    remove_spike_entry(tracker_path, symbol)
                 decisions.append(
                     Decision(
                         symbol,
@@ -393,6 +454,11 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
                         qty=qty,
                     )
                 )
+                continue
+            # Force-exit spike positions that have held for 1 session (entry_date < today)
+            if symbol in spike_exit_symbols:
+                remove_spike_entry(tracker_path, symbol)
+                decisions.append(Decision(symbol, "sell", "spike 1-day hold exit", qty=qty))
                 continue
             if symbol in target_symbols:
                 continue
@@ -416,13 +482,15 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
                 continue
             decisions.append(Decision(symbol, "sell", "adaptive rebalance out", qty=qty))
 
-        if risk_off or bear_blocked or not selected:
+        if (risk_off and not rebound.active) or (bear_blocked and not rebound.active) or not selected:
             return decisions
 
         account = bot.trading.get_account()
         equity = float(getattr(account, "equity", 0.0) or 0.0)
         buying_power = float(getattr(account, "buying_power", 0.0) or 0.0)
-        if live_use_full_bull:
+        if rebound.active:
+            total_pool = equity * float(settings.get("rebound_exposure_pct", 0.55))
+        elif live_use_full_bull:
             total_pool = equity * bull_exposure_pct
         else:
             regime_mult = neutral_sizing_pct if (regime_filter_enabled and regime == MarketRegime.NEUTRAL) else 1.0
@@ -462,7 +530,7 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
                     candidate.symbol,
                     "buy",
                     (
-                        f"adaptive target score={candidate.score:.2f}{gap_note}; "
+                        f"{'rebound' if rebound.active else 'adaptive'} target score={candidate.score:.2f}{gap_note}; "
                         f"sector={sector_return:.2f}% slow={sector_slow_return:.2f}% dd={sector_drawdown:.2f}%"
                     ),
                     notional=buy_notional,
@@ -553,6 +621,9 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
             symbol_sma_filter_days,
             atr_lookback_days + 1,
             breadth_sma_days if breadth_filter_enabled else 0,
+            int(settings.get("rebound_fast_lookback_days", 5)) if settings.get("rebound_mode_enabled", False) else 0,
+            int(settings.get("rebound_breadth_sma_days", 5)) if settings.get("rebound_mode_enabled", False) else 0,
+            int(settings.get("rebound_symbol_lookback_days", 3)) if settings.get("rebound_mode_enabled", False) else 0,
             50,
             30,
         )
@@ -597,6 +668,7 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
                 if regime_filter_enabled
                 else MarketRegime.BULL
             )
+            rebound = detect_rebound_context(bars_by_symbol, risk_bars_by_symbol, current_date, settings)
             for symbol, position in positions.items():
                 if position.qty <= 0 or symbol not in today_bars:
                     continue
@@ -649,34 +721,50 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
                 and sector_return >= bull_sector_min_return
                 and sector_fast_return >= bull_sector_fast_min_return
                 and not drawdown_breaker_tripped
+                and not rebound.active
             )
-            effective_rebalance_days = rebalance_days_bull if use_full_bull else rebalance_days
-            effective_max_symbols = bull_max_symbols if use_full_bull else max_symbols
+            effective_rebalance_days = (
+                int(settings.get("rebound_rebalance_days", rebalance_days))
+                if rebound.active
+                else rebalance_days_bull if use_full_bull else rebalance_days
+            )
+            effective_max_symbols = (
+                int(settings.get("rebound_max_symbols", max_symbols))
+                if rebound.active
+                else bull_max_symbols if use_full_bull else max_symbols
+            )
             should_rebalance = day_index - last_rebalance_index >= effective_rebalance_days
             if should_rebalance:
-                candidates = rank_adaptive_candidates(
-                    bars_by_symbol=bars_by_symbol,
-                    current_date=current_date,
-                    fast_lookback=fast_lookback,
-                    slow_lookback=slow_lookback,
-                    sector_lookback=sector_lookback,
-                    min_sector_return=min_sector_return,
-                    min_symbol_return=min_symbol_return,
-                    symbol_sma_filter_days=symbol_sma_filter_days,
-                    use_sma_alignment=use_sma_alignment,
-                    use_relative_strength=use_relative_strength,
-                    use_trend_consistency=use_trend_consistency,
-                    use_momentum_acceleration=use_momentum_acceleration,
-                    momentum_acceleration_weight=momentum_acceleration_weight,
-                    slow_momentum_weight=slow_momentum_weight,
-                    fast_momentum_weight=fast_momentum_weight,
-                    short_momentum_weight=short_momentum_weight,
-                    volume_weight=volume_weight,
-                    sector_weight_score=sector_weight_score,
-                    high_proximity_weight=high_proximity_weight,
-                    sma_alignment_weight=sma_alignment_weight,
-                    trend_consistency_weight=trend_consistency_weight,
-                )
+                if rebound.active:
+                    candidates = rank_rebound_candidates(
+                        bars_by_symbol=bars_by_symbol,
+                        current_date=current_date,
+                        settings=settings,
+                    )
+                else:
+                    candidates = rank_adaptive_candidates(
+                        bars_by_symbol=bars_by_symbol,
+                        current_date=current_date,
+                        fast_lookback=fast_lookback,
+                        slow_lookback=slow_lookback,
+                        sector_lookback=sector_lookback,
+                        min_sector_return=min_sector_return,
+                        min_symbol_return=min_symbol_return,
+                        symbol_sma_filter_days=symbol_sma_filter_days,
+                        use_sma_alignment=use_sma_alignment,
+                        use_relative_strength=use_relative_strength,
+                        use_trend_consistency=use_trend_consistency,
+                        use_momentum_acceleration=use_momentum_acceleration,
+                        momentum_acceleration_weight=momentum_acceleration_weight,
+                        slow_momentum_weight=slow_momentum_weight,
+                        fast_momentum_weight=fast_momentum_weight,
+                        short_momentum_weight=short_momentum_weight,
+                        volume_weight=volume_weight,
+                        sector_weight_score=sector_weight_score,
+                        high_proximity_weight=high_proximity_weight,
+                        sma_alignment_weight=sma_alignment_weight,
+                        trend_consistency_weight=trend_consistency_weight,
+                    )
                 candidates = apply_buzz_earnings_overlay(
                     candidates=candidates,
                     current_date=current_date,
@@ -695,8 +783,8 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
                 )
                 bear_blocked = regime_filter_enabled and regime == MarketRegime.BEAR and bear_block_entries
                 target_symbols = (
-                    set() if (risk_off or bear_blocked)
-                    else {candidate.symbol for candidate in candidates[:max_symbols]}
+                    set() if ((risk_off or bear_blocked) and not rebound.active)
+                    else {candidate.symbol for candidate in candidates[:effective_max_symbols]}
                 )
 
                 for symbol, position in positions.items():
@@ -704,8 +792,8 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
                         continue
                     if (
                         retain_winners
-                        and not risk_off
-                        and not bear_blocked
+                        and (not risk_off or rebound.active)
+                        and (not bear_blocked or rebound.active)
                         and should_retain_winner(
                             symbol=symbol,
                             position=position,
@@ -730,15 +818,20 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
                         timestamp=bar.timestamp,
                         price=apply_slippage(bar.open, "sell", slippage_bps),
                         reason=(
+                            "rebound rebalance out"
+                            if rebound.active
+                            else
                             "adaptive risk-off rebalance to cash"
                             if risk_off
                             else "adaptive rebalance out"
                         ),
                     )
 
-                selected = candidates[:effective_max_symbols] if not (risk_off or bear_blocked) else []
+                selected = candidates[:effective_max_symbols] if not ((risk_off or bear_blocked) and not rebound.active) else []
                 if selected:
-                    if use_full_bull:
+                    if rebound.active:
+                        total_pool = current_equity * float(settings.get("rebound_exposure_pct", 0.55))
+                    elif use_full_bull:
                         total_pool = current_equity * bull_exposure_pct
                     else:
                         regime_mult = neutral_sizing_pct if (regime_filter_enabled and regime == MarketRegime.NEUTRAL) else 1.0
@@ -778,7 +871,7 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
                                 notional=buy_notional,
                                 cash_after=cash,
                                 reason=(
-                                    f"adaptive score={candidate.score:.2f} "
+                                    f"{'rebound' if rebound.active else 'adaptive'} score={candidate.score:.2f} "
                                     f"fast={candidate.fast_return_pct:.2f}% slow={candidate.slow_return_pct:.2f}% "
                                     f"volume={candidate.volume_ratio:.2f}x sector={sector_return:.2f}% "
                                     f"sector_slow={sector_slow_return:.2f}% sector_dd={sector_drawdown:.2f}%"
@@ -968,6 +1061,110 @@ def rank_adaptive_candidates(
                 momentum_acceleration=momentum_acceleration,
             )
         )
+    return sorted(candidates, key=lambda item: item.score, reverse=True)
+
+
+def detect_rebound_context(
+    bars_by_symbol: dict[str, list[DailyBar]],
+    risk_bars_by_symbol: dict[str, list[DailyBar]],
+    current_date: date,
+    settings: dict[str, Any],
+) -> ReboundContext:
+    if not bool(settings.get("rebound_mode_enabled", False)):
+        return ReboundContext(False, 0.0, 0.0, 0.0, 0.0, "rebound disabled")
+
+    drawdown_lookback = int(settings.get("sector_drawdown_lookback_days", 63))
+    fast_lookback = int(settings.get("rebound_fast_lookback_days", 5))
+    breadth_sma_days = int(settings.get("rebound_breadth_sma_days", 5))
+    trigger_drawdown = float(settings.get("rebound_trigger_drawdown_pct", -15.0))
+    min_sector_fast = float(settings.get("rebound_min_sector_fast_return_pct", 3.0))
+    min_market_fast = float(settings.get("rebound_min_market_fast_return_pct", 0.5))
+    min_breadth = float(settings.get("rebound_min_breadth_pct", 0.45))
+
+    drawdown = sector_drawdown_pct(bars_by_symbol, current_date, drawdown_lookback)
+    sector_fast = sector_return_pct(bars_by_symbol, current_date, fast_lookback)
+    market_fast = sector_return_pct(risk_bars_by_symbol, current_date, fast_lookback) if risk_bars_by_symbol else sector_fast
+    breadth = sector_breadth_pct(bars_by_symbol, current_date, breadth_sma_days)
+
+    failures: list[str] = []
+    if drawdown > trigger_drawdown:
+        failures.append(f"drawdown {drawdown:.2f}% > trigger {trigger_drawdown:.2f}%")
+    if sector_fast < min_sector_fast:
+        failures.append(f"sector fast {sector_fast:.2f}% < {min_sector_fast:.2f}%")
+    if market_fast < min_market_fast:
+        failures.append(f"market fast {market_fast:.2f}% < {min_market_fast:.2f}%")
+    if breadth < min_breadth:
+        failures.append(f"short breadth {breadth:.0%} < {min_breadth:.0%}")
+
+    active = not failures
+    reason = (
+        f"rebound active: dd={drawdown:.2f}% sector_fast={sector_fast:.2f}% "
+        f"market_fast={market_fast:.2f}% breadth={breadth:.0%}"
+        if active
+        else "rebound inactive: " + "; ".join(failures)
+    )
+    return ReboundContext(
+        active=active,
+        sector_drawdown_pct=drawdown,
+        sector_fast_return_pct=sector_fast,
+        market_fast_return_pct=market_fast,
+        short_breadth_pct=breadth,
+        reason=reason,
+    )
+
+
+def rank_rebound_candidates(
+    bars_by_symbol: dict[str, list[DailyBar]],
+    current_date: date,
+    settings: dict[str, Any],
+) -> list[AdaptiveCandidate]:
+    lookback = int(settings.get("rebound_symbol_lookback_days", 3))
+    min_return = float(settings.get("rebound_min_symbol_return_pct", 2.0))
+    volume_weight = float(settings.get("rebound_volume_weight", 2.0))
+    drawdown_weight = float(settings.get("rebound_drawdown_weight", 0.25))
+    min_bars_needed = max(lookback + 1, 21, 63)
+
+    candidates: list[AdaptiveCandidate] = []
+    for symbol, bars in bars_by_symbol.items():
+        prior = [bar for bar in bars if bar.timestamp.date() < current_date]
+        if len(prior) <= min_bars_needed:
+            continue
+        latest = prior[-1]
+        base = prior[-lookback - 1]
+        if base.close <= 0:
+            continue
+        rebound_return = ((latest.close / base.close) - 1) * 100
+        if rebound_return < min_return:
+            continue
+
+        one_day_return = 0.0
+        if prior[-2].close > 0:
+            one_day_return = ((latest.close / prior[-2].close) - 1) * 100
+        five_day_return = 0.0
+        if prior[-6].close > 0:
+            five_day_return = ((latest.close / prior[-6].close) - 1) * 100
+        avg_volume = sum(bar.volume for bar in prior[-20:]) / 20
+        volume_ratio = latest.volume / avg_volume if avg_volume > 0 else 1.0
+        lookback_high = max(bar.close for bar in prior[-63:])
+        drawdown_from_high = ((latest.close / lookback_high) - 1) * 100 if lookback_high > 0 else 0.0
+
+        score = (
+            rebound_return * 2.0
+            + one_day_return
+            + five_day_return * 0.6
+            + min(volume_ratio, 4.0) * volume_weight
+            + abs(min(drawdown_from_high, 0.0)) * drawdown_weight
+        )
+        candidates.append(
+            AdaptiveCandidate(
+                symbol=symbol,
+                score=score,
+                fast_return_pct=rebound_return,
+                slow_return_pct=five_day_return,
+                volume_ratio=volume_ratio,
+            )
+        )
+
     return sorted(candidates, key=lambda item: item.score, reverse=True)
 
 

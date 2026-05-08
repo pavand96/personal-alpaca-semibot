@@ -1,0 +1,20 @@
+CRON_TZ=America/New_York
+
+# Adaptive semi trade runner — every 5 min during NYSE hours, Mon-Fri
+# Dry-run:          2026-05-08 -> 2026-06-05
+# Paper execution:  2026-06-08 -> 2026-07-07
+# The script decides which phase based on date; the bot's require_market_open
+# guard blocks execution outside NYSE open hours.
+
+# 4:00, 7:00, 9:00 — start/fallback pre-market extended-hours spike scanner.
+# A lock in the script prevents duplicate scanner loops if an earlier one is still running.
+0 4,7,9 * * 1-5 /home/pavand96/personal-alpaca-semibot/scripts/run_premarket_trade.sh
+
+# 9:45, 9:50, 9:55 — catch early-morning open signals
+45,50,55 9 * * 1-5 /home/pavand96/personal-alpaca-semibot/scripts/run_ml_trade.sh
+
+# 10:00-15:55 — every 5 min through the core trading session
+*/5 10-15 * * 1-5 /home/pavand96/personal-alpaca-semibot/scripts/run_ml_trade.sh
+
+# 16:00, 16:05, 16:10 — exit-before-close window
+0,5,10 16 * * 1-5 /home/pavand96/personal-alpaca-semibot/scripts/run_ml_trade.sh

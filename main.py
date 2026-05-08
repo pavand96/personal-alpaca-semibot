@@ -31,6 +31,7 @@ from semibot.ml import (
     print_optimization_results,
     print_training_result,
 )
+from semibot.premarket_backtest import print_premarket_gap_result, run_premarket_gap_backtest
 from semibot.sector_allocator import (
     SectorMomentumAllocatorBacktester,
     print_sector_allocator_result,
@@ -48,6 +49,7 @@ _DATE_REQUIRED_COMMANDS = frozenset([
     "sector-allocator-backtest",
     "sector-balanced-backtest",
     "adaptive-semis-backtest",
+    "premarket-gap-backtest",
     "sector-swing-backtest",
     "train-model",
     "ml-backtest",
@@ -134,6 +136,18 @@ def main() -> None:
         write_adaptive_allocator_trades(config["adaptive_semis_allocator"]["trades_file"], result.trades)
         print(f"\nAdaptive semi trade history written to {config['adaptive_semis_allocator']['trades_file']}")
 
+    def cmd_premarket_gap_backtest() -> None:
+        result, stats = run_premarket_gap_backtest(
+            config,
+            api_key=api_key,
+            secret_key=secret_key,
+            start=start,
+            end=end,
+        )
+        print_premarket_gap_result(result, stats)
+        write_adaptive_allocator_trades(config["adaptive_semis_allocator"]["trades_file"], result.trades)
+        print(f"\nPremarket gap proxy trade history written to {config['adaptive_semis_allocator']['trades_file']}")
+
     def cmd_sector_swing_backtest() -> None:
         result = SectorSwingAllocatorBacktester(
             config, api_key=api_key, secret_key=secret_key
@@ -210,11 +224,12 @@ def main() -> None:
         Tracks symbols already ordered this session to prevent duplicates.
         Exits when market opens (pre-market window) or at 7:45pm ET (after-hours window).
         """
-        from zoneinfo import ZoneInfo
-        _tz = ZoneInfo("America/New_York")
         import datetime as _dt
+        from zoneinfo import ZoneInfo
+
         from semibot.bot import SemiMomentumBot
 
+        _tz = ZoneInfo("America/New_York")
         bot = AdaptiveSemiPortfolioBacktester(config, api_key=api_key, secret_key=secret_key)
         interval = int(config["runtime"].get("spike_interval_seconds", 60))
         ordered_today: set[str] = set()
@@ -274,6 +289,7 @@ def main() -> None:
         "sector-allocator-backtest": cmd_sector_allocator_backtest,
         "sector-balanced-backtest": cmd_sector_balanced_backtest,
         "adaptive-semis-backtest": cmd_adaptive_semis_backtest,
+        "premarket-gap-backtest": cmd_premarket_gap_backtest,
         "sector-swing-backtest": cmd_sector_swing_backtest,
         "train-model": cmd_train_model,
         "ml-backtest": cmd_ml_backtest,

@@ -489,9 +489,12 @@ adaptive_semis_allocator:
   # Extended-hours spike capture (spike-run/spike-trade; also premarket-* and afterhours-* aliases)
   # Pre-market:  gap = (current price / yesterday's 4pm close) - 1
   # After-hours: gap = (current price / today's 4pm close) - 1
-  spike_min_gap_pct: 3.0          # enter if spike >= 3%
+  spike_min_gap_pct: 5.0          # enter if spike >= 5% (3-5% gaps are coin flip per backtest)
   spike_max_gap_pct: 20.0         # skip if spike > 20% (reversal risk)
   spike_notional_per_trade: 1000.0  # notional per position — increase once validated
+  spike_sector_confirm: 3           # require 3+ watchlist symbols gapping before entering
+  spike_tracker_path: logs/spike_tracker.json  # tracks entries for 1-day hold exit
+  earnings_notional_multiplier: 1.5  # boost notional 1.5× when earnings detected in news
   score_proportional_sizing: true
   bull_exposure_pct: 0.80
   bull_max_symbols: 5
@@ -502,4 +505,20 @@ adaptive_semis_allocator:
   breadth_filter_enabled: true
   breadth_sma_days: 50
   min_breadth_pct: 0.5
+  # Rebound mode: a controlled risk-on override after semis have been hit hard
+  # and short-term breadth/returns start repairing before long SMAs recover.
+  rebound_mode_enabled: true
+  rebound_trigger_drawdown_pct: -8.0
+  rebound_fast_lookback_days: 5
+  rebound_min_sector_fast_return_pct: 2.0
+  rebound_min_market_fast_return_pct: -0.5
+  rebound_breadth_sma_days: 5
+  rebound_min_breadth_pct: 0.35
+  rebound_symbol_lookback_days: 3
+  rebound_min_symbol_return_pct: 2.0
+  rebound_exposure_pct: 0.55
+  rebound_max_symbols: 5
+  rebound_rebalance_days: 2
+  rebound_volume_weight: 2.0
+  rebound_drawdown_weight: 0.25
   trades_file: logs/adaptive_semis_trades.csv
