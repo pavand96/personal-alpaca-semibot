@@ -37,28 +37,26 @@ from semibot.swing_allocator import (
     write_sector_swing_trades,
 )
 
+_DATE_REQUIRED_COMMANDS = frozenset([
+    "backtest",
+    "intraday-backtest",
+    "sector-allocator-backtest",
+    "sector-balanced-backtest",
+    "sector-swing-backtest",
+    "train-model",
+    "ml-backtest",
+    "kelly-analysis",
+    "optimize-ml-params",
+])
+
+_ALL_COMMANDS = sorted(
+    _DATE_REQUIRED_COMMANDS | {"monitor", "trade-once", "run", "ml-signal", "ml-trade-once"}
+)
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Alpaca semiconductor momentum monitor/trader")
-    parser.add_argument(
-        "command",
-        choices=[
-            "monitor",
-            "trade-once",
-            "run",
-            "backtest",
-            "intraday-backtest",
-            "sector-allocator-backtest",
-            "sector-balanced-backtest",
-            "sector-swing-backtest",
-            "train-model",
-            "ml-backtest",
-            "kelly-analysis",
-            "optimize-ml-params",
-            "ml-signal",
-            "ml-trade-once",
-        ],
-    )
+    parser.add_argument("command", choices=_ALL_COMMANDS)
     parser.add_argument("--config", default="config.yml", help="Path to YAML config")
     parser.add_argument("--start", help="Backtest start date, YYYY-MM-DD")
     parser.add_argument("--end", help="Backtest end date, YYYY-MM-DD. Defaults to today.")
@@ -77,17 +75,9 @@ def main() -> None:
 
     config = load_config(args.config)
 
-    if args.command in {
-        "backtest",
-        "intraday-backtest",
-        "sector-allocator-backtest",
-        "sector-balanced-backtest",
-        "sector-swing-backtest",
-        "train-model",
-        "ml-backtest",
-        "kelly-analysis",
-        "optimize-ml-params",
-    }:
+    start: date | None = None
+    end: date | None = None
+    if args.command in _DATE_REQUIRED_COMMANDS:
         if not args.start:
             raise SystemExit(f"{args.command} requires --start YYYY-MM-DD")
         start = date.fromisoformat(args.start)
@@ -95,83 +85,65 @@ def main() -> None:
         if end <= start:
             raise SystemExit("--end must be after --start")
 
-    if args.command == "backtest":
+    def cmd_backtest() -> None:
         result = Backtester(config, api_key=api_key, secret_key=secret_key).run(start=start, end=end)
         print_backtest_result(result)
         write_trades_csv(config["backtest"]["trades_file"], result.trades)
         print(f"\nTrade history written to {config['backtest']['trades_file']}")
-        return
 
-    if args.command == "intraday-backtest":
+    def cmd_intraday_backtest() -> None:
         result = IntradayOpeningMomentumBacktester(
-            config,
-            api_key=api_key,
-            secret_key=secret_key,
+            config, api_key=api_key, secret_key=secret_key
         ).run(start=start, end=end)
         print_intraday_result(result)
         write_intraday_trades_csv(config["intraday"]["trades_file"], result.trades)
         print(f"\nIntraday trade history written to {config['intraday']['trades_file']}")
-        return
 
-    if args.command == "sector-allocator-backtest":
+    def cmd_sector_allocator_backtest() -> None:
         result = SectorMomentumAllocatorBacktester(
-            config,
-            api_key=api_key,
-            secret_key=secret_key,
+            config, api_key=api_key, secret_key=secret_key
         ).run(start=start, end=end)
         print_sector_allocator_result(result)
         write_sector_allocator_trades(config["sector_allocator"]["trades_file"], result.trades)
         print(f"\nSector allocator trade history written to {config['sector_allocator']['trades_file']}")
-        return
 
-    if args.command == "sector-balanced-backtest":
+    def cmd_sector_balanced_backtest() -> None:
         result = BalancedSectorAllocatorBacktester(
-            config,
-            api_key=api_key,
-            secret_key=secret_key,
+            config, api_key=api_key, secret_key=secret_key
         ).run(start=start, end=end)
         print_balanced_allocator_result(result)
-        return
 
-    if args.command == "sector-swing-backtest":
+    def cmd_sector_swing_backtest() -> None:
         result = SectorSwingAllocatorBacktester(
-            config,
-            api_key=api_key,
-            secret_key=secret_key,
+            config, api_key=api_key, secret_key=secret_key
         ).run(start=start, end=end)
         print_sector_swing_result(result)
         write_sector_swing_trades(config["sector_swing_allocator"]["trades_file"], result.trades)
         print(f"\nSector swing trade history written to {config['sector_swing_allocator']['trades_file']}")
-        return
 
-    if args.command == "train-model":
+    def cmd_train_model() -> None:
         result = MLStrategy(config, api_key=api_key, secret_key=secret_key).train(start=start, end=end)
         print_training_result(result)
-        return
 
-    if args.command == "ml-backtest":
+    def cmd_ml_backtest() -> None:
         result = MLStrategy(config, api_key=api_key, secret_key=secret_key).ml_backtest(start=start, end=end)
         print("ML backtest")
         print_backtest_result(result)
         write_trades_csv(config["ml"]["ml_trades_file"], result.trades)
         print(f"\nML trade history written to {config['ml']['ml_trades_file']}")
-        return
 
-    if args.command == "kelly-analysis":
+    def cmd_kelly_analysis() -> None:
         result, kelly = MLStrategy(config, api_key=api_key, secret_key=secret_key).kelly_analysis(
-            start=start,
-            end=end,
+            start=start, end=end
         )
         print_kelly_result(result, kelly)
-        return
 
-    if args.command == "optimize-ml-params":
+    def cmd_optimize_ml_params() -> None:
         strategy = MLStrategy(config, api_key=api_key, secret_key=secret_key)
         results = strategy.optimize_parameters(start=start, end=end)
         print_optimization_results(results, config["ml"]["optimizer_results_file"])
-        return
 
-    if args.command == "ml-signal":
+    def cmd_ml_signal() -> None:
         strategy = MLStrategy(config, api_key=api_key, secret_key=secret_key)
         signals = strategy.latest_signals()
         print_ml_signals(
@@ -179,27 +151,44 @@ def main() -> None:
             buy_probability=float(config["ml"]["buy_probability"]),
             sell_probability=float(config["ml"]["sell_probability"]),
         )
-        return
 
-    if args.command == "ml-trade-once":
+    def cmd_ml_trade_once() -> None:
         MLStrategy(config, api_key=api_key, secret_key=secret_key).ml_trade_once(execute=args.execute)
-        return
 
-    bot = SemiMomentumBot(config, api_key=api_key, secret_key=secret_key)
+    def cmd_monitor() -> None:
+        SemiMomentumBot(config, api_key=api_key, secret_key=secret_key).monitor()
 
-    if args.command == "monitor":
-        bot.monitor()
-        return
+    def cmd_trade_once() -> None:
+        SemiMomentumBot(config, api_key=api_key, secret_key=secret_key).trade_once(execute=args.execute)
 
-    if args.command == "trade-once":
-        bot.trade_once(execute=args.execute)
-        return
+    def cmd_run() -> None:
+        bot = SemiMomentumBot(config, api_key=api_key, secret_key=secret_key)
+        interval = int(config["runtime"]["interval_seconds"])
+        while True:
+            print(time.strftime("%Y-%m-%d %H:%M:%S"), "running trading check")
+            try:
+                bot.trade_once(execute=args.execute)
+            except Exception as exc:
+                print(f"Error during trading check, retrying next interval: {exc}")
+            time.sleep(interval)
 
-    interval = int(config["runtime"]["interval_seconds"])
-    while True:
-        print(time.strftime("%Y-%m-%d %H:%M:%S"), "running trading check")
-        bot.trade_once(execute=args.execute)
-        time.sleep(interval)
+    commands: dict[str, object] = {
+        "backtest": cmd_backtest,
+        "intraday-backtest": cmd_intraday_backtest,
+        "sector-allocator-backtest": cmd_sector_allocator_backtest,
+        "sector-balanced-backtest": cmd_sector_balanced_backtest,
+        "sector-swing-backtest": cmd_sector_swing_backtest,
+        "train-model": cmd_train_model,
+        "ml-backtest": cmd_ml_backtest,
+        "kelly-analysis": cmd_kelly_analysis,
+        "optimize-ml-params": cmd_optimize_ml_params,
+        "ml-signal": cmd_ml_signal,
+        "ml-trade-once": cmd_ml_trade_once,
+        "monitor": cmd_monitor,
+        "trade-once": cmd_trade_once,
+        "run": cmd_run,
+    }
+    commands[args.command]()
 
 
 if __name__ == "__main__":

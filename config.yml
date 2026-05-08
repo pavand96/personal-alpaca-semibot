@@ -133,7 +133,9 @@ backtest:
 ml:
   model_path: models/semibot_model.joblib
   # Supported: logistic_regression, random_forest, hist_gradient_boosting
-  model_type: logistic_regression
+  # hist_gradient_boosting handles missing values natively and is more robust
+  # to class imbalance than logistic_regression. Retrain after changing this.
+  model_type: hist_gradient_boosting
   # Label a row positive when the close after this many trading days is above target_return_pct.
   horizon_days: 3
   target_return_pct: 1.0
@@ -160,7 +162,7 @@ ml:
   # Gap between train folds and validation folds. 1 day leaks when features
   # use multi-day rolling windows that span the fold boundary. 5 days is the
   # minimum to avoid lookahead with the 3-day prediction horizon.
-  validation_gap_days: 5
+  validation_gap_days: 10
   random_state: 42
   ml_trades_file: logs/ml_backtest_trades.csv
   optimizer_results_file: logs/ml_parameter_optimization.csv
@@ -193,9 +195,9 @@ sector_allocator:
   sector_lookback_days: 5
   min_sector_lookback_return_pct: 0.5
   max_symbols_per_day: 1
-  base_notional: 9500.0
-  max_notional_per_trade: 9500.0
-  max_total_notional: 9500.0
+  base_notional: 4500.0
+  max_notional_per_trade: 4500.0
+  max_total_notional: 4500.0
   min_open_gain_pct: 0.25
   max_open_gain_pct: 5.0
   relative_volume_min: 1.2
@@ -213,7 +215,7 @@ sector_swing_allocator:
   fast_momentum_days: 5
   min_symbol_momentum_pct: 0.0
   max_symbols: 1
-  max_total_exposure: 9500.0
+  max_total_exposure: 4500.0
   rebalance_days: 3
   trailing_stop_pct: 20.0
   trades_file: logs/sector_swing_trades.csv
