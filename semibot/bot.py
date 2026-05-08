@@ -231,6 +231,7 @@ class SemiMomentumBot:
         result = self.trading.submit_order(order_data=order)
         mode = "PREMARKET" if extended_hours else order_type.upper()
         print(f"Submitted {mode} {decision.action.upper()} {decision.symbol}: order_id={result.id}")  # type: ignore[union-attr]
+        return result
 
     def get_latest_price(self, symbol: str) -> float:
         snapshots = self.data.get_stock_snapshot(

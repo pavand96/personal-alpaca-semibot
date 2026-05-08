@@ -1717,6 +1717,11 @@ def submit_adaptive_decisions(
     max_orders: int,
     extended_hours: bool = False,
 ) -> list[Decision]:
+    from semibot import ledger as _ledger
+    from semibot.bot import floor_order_qty, limit_price_for_side
+
+    ledger_db: str = str(bot.config.get("runtime", {}).get("ledger_db", _ledger.DEFAULT_DB))
+
     submitted: list[Decision] = []
     for decision in decisions:
         if len(submitted) >= max_orders:
@@ -1725,12 +1730,47 @@ def submit_adaptive_decisions(
             print(f"ADAPTIVE HOLD {format_decision(decision)}")
             bot.log_decision(decision, event="adaptive_hold")
             continue
+
+        # Best-effort price for ledger (does not affect the order itself)
+        try:
+            approx_price = bot.get_latest_price(decision.symbol)
+        except Exception:
+            approx_price = 0.0
+
+        if decision.action == "buy":
+            offset_bps = float(bot.config.get("orders", {}).get(
+                "premarket_limit_offset_bps" if extended_hours else "limit_price_offset_bps", 10.0
+            ))
+            lp = limit_price_for_side(approx_price, "buy", offset_bps) if approx_price > 0 else 0.0
+            fill_qty = floor_order_qty(decision.notional, lp) if lp > 0 else 0.0
+            fill_price = lp
+            notional = decision.notional
+        else:
+            fill_qty = decision.qty
+            offset_bps = float(bot.config.get("orders", {}).get(
+                "premarket_limit_offset_bps" if extended_hours else "limit_price_offset_bps", 10.0
+            ))
+            fill_price = limit_price_for_side(approx_price, "sell", offset_bps) if approx_price > 0 else 0.0
+            notional = fill_qty * fill_price
+
         if dry_run:
             print(f"ADAPTIVE DRY RUN {format_decision(decision)}")
             bot.log_decision(decision, event="adaptive_dry_run_order")
+            _ledger.record_fill(
+                ledger_db, decision.symbol, decision.action,
+                fill_qty, fill_price, notional,
+                decision.reason, strategy="adaptive", dry_run=True,
+            )
         else:
-            bot.submit_order(decision, extended_hours=extended_hours)
+            result = bot.submit_order(decision, extended_hours=extended_hours)
             bot.log_decision(decision, event="adaptive_submitted_order")
+            order_id = str(getattr(result, "id", "")) if result is not None else None
+            _ledger.record_fill(
+                ledger_db, decision.symbol, decision.action,
+                fill_qty, fill_price, notional,
+                decision.reason, strategy="adaptive",
+                order_id=order_id, dry_run=False,
+            )
         submitted.append(decision)
     return submitted
 

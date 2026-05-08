@@ -67,6 +67,7 @@ _ALL_COMMANDS = sorted(
         "spike-run", "spike-trade",             # fallback polling variants
         "premarket-run", "premarket-trade",     # aliases for spike-run/trade
         "afterhours-run", "afterhours-trade",   # aliases for spike-run/trade
+        "ledger",                               # print performance ledger report
     }
 )
 
@@ -275,6 +276,11 @@ def main() -> None:
         """Scan recent news for catalyst signals and update the signals file."""
         run_news_monitor(config, api_key=api_key, secret_key=secret_key)
 
+    def cmd_ledger() -> None:
+        from semibot.ledger import print_ledger
+        db_path = str(config.get("runtime", {}).get("ledger_db", "logs/ledger.db"))
+        print_ledger(db_path, api_key=api_key, secret_key=secret_key, config=config)
+
     def cmd_premarket_run() -> None:
         cmd_spike_run()
 
@@ -315,6 +321,7 @@ def main() -> None:
         "afterhours-trade": cmd_afterhours_trade,
         "afterhours-run": cmd_afterhours_run,
         "run": cmd_run,
+        "ledger": cmd_ledger,
     }
     commands[args.command]()
 

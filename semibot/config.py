@@ -313,6 +313,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "interval_seconds": 300,
         "spike_interval_seconds": 60,
         "log_file": "logs/semibot_events.csv",
+        "ledger_db": "logs/ledger.db",
     },
     "backtest": {
         "initial_cash": 10000.0,

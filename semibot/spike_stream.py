@@ -40,6 +40,7 @@ from alpaca.data.requests import StockSnapshotRequest
 
 from semibot.bot import SemiMomentumBot, floor_order_qty, limit_price_for_side
 from semibot.events import append_event
+from semibot import ledger as _ledger
 from semibot.spike_tracker import record_spike_entry
 
 log = logging.getLogger(__name__)
@@ -286,6 +287,7 @@ class SpikeStreamScanner:
         # Held-symbols REST cache (refreshed at most every 30s)
         self._held_cache: set[str] = set()
         self._held_cache_ts: float = 0.0
+        self._ledger_db: str = str(config.get("runtime", {}).get("ledger_db", _ledger.DEFAULT_DB))
 
     def load_references(self) -> None:
         liquid = self.config["watchlist"]
@@ -386,9 +388,20 @@ class SpikeStreamScanner:
         limit_price = limit_price_for_side(current_price, "buy", self._offset_bps)
         qty = floor_order_qty(notional, limit_price)
 
-        label = f"spike gap={gap_pct:+.1f}%"
+        parts = [f"spike gap={gap_pct:+.1f}%"]
+        if symbol in self._earnings_today:
+            parts.append("earnings_today")
+        if is_spec:
+            parts.append("spec_bucket")
+        reason = " ".join(parts)
+        strategy = "spike_spec" if is_spec else "spike_liquid"
+
         if self._dry_run:
-            print(f"  DRY-RUN  BUY {symbol}  {qty:.4f}sh @ ${limit_price:.2f}  [{label}]")
+            print(f"  DRY-RUN  BUY {symbol}  {qty:.4f}sh @ ${limit_price:.2f}  [{reason}]")
+            _ledger.record_fill(
+                self._ledger_db, symbol, "buy", qty, limit_price, notional,
+                reason, strategy=strategy, dry_run=True,
+            )
             return
 
         order = LimitOrderRequest(
@@ -401,7 +414,8 @@ class SpikeStreamScanner:
             client_order_id=f"spike-{symbol}-{uuid4().hex[:10]}",
         )
         result = bot.trading.submit_order(order_data=order)
-        print(f"  ORDER    BUY {symbol}  {qty:.4f}sh @ ${limit_price:.2f}  [{label}]  id={result.id}")  # type: ignore[union-attr]
+        order_id = str(result.id)  # type: ignore[union-attr]
+        print(f"  ORDER    BUY {symbol}  {qty:.4f}sh @ ${limit_price:.2f}  [{reason}]  id={order_id}")
         try:
             record_spike_entry(self._tracker_path, symbol, gap_pct, current_price)
         except Exception as exc:
@@ -414,10 +428,14 @@ class SpikeStreamScanner:
                 "price": current_price,
                 "limit_price": limit_price,
                 "qty": qty,
-                "order_id": str(result.id),  # type: ignore[union-attr]
+                "order_id": order_id,
             })
         except Exception as exc:
             log.warning("Could not append spike order event: %s", exc)
+        _ledger.record_fill(
+            self._ledger_db, symbol, "buy", qty, limit_price, notional,
+            reason, strategy=strategy, order_id=order_id, dry_run=False,
+        )
 
     def _place_sell_order(self, symbol: str, gap_pct: float, current_price: float) -> None:
         """Sell existing position via extended-hours limit order on earnings miss."""
@@ -437,10 +455,15 @@ class SpikeStreamScanner:
             return
 
         limit_price = limit_price_for_side(current_price, "sell", self._offset_bps)
-        label = f"earnings miss gap={gap_pct:+.1f}%"
+        reason = f"earnings_miss gap={gap_pct:+.1f}%"
+        notional_sell = qty * limit_price
 
         if self._dry_run:
-            print(f"  DRY-RUN  SELL {symbol}  {qty:.4f}sh @ ${limit_price:.2f}  [{label}]")
+            print(f"  DRY-RUN  SELL {symbol}  {qty:.4f}sh @ ${limit_price:.2f}  [{reason}]")
+            _ledger.record_fill(
+                self._ledger_db, symbol, "sell", qty, limit_price, notional_sell,
+                reason, strategy="spike_sell", dry_run=True,
+            )
             return
 
         order = LimitOrderRequest(
@@ -453,7 +476,8 @@ class SpikeStreamScanner:
             client_order_id=f"spike-sell-{symbol}-{uuid4().hex[:10]}",
         )
         result = bot.trading.submit_order(order_data=order)
-        print(f"  SELL     {symbol}  {qty:.4f}sh @ ${limit_price:.2f}  [{label}]  id={result.id}")  # type: ignore[union-attr]
+        order_id = str(result.id)  # type: ignore[union-attr]
+        print(f"  SELL     {symbol}  {qty:.4f}sh @ ${limit_price:.2f}  [{reason}]  id={order_id}")
         try:
             from semibot.spike_tracker import remove_spike_entry
             remove_spike_entry(self._tracker_path, symbol)
@@ -467,10 +491,14 @@ class SpikeStreamScanner:
                 "price": current_price,
                 "limit_price": limit_price,
                 "qty": qty,
-                "order_id": str(result.id),  # type: ignore[union-attr]
+                "order_id": order_id,
             })
         except Exception as exc:
             log.warning("Could not append sell event: %s", exc)
+        _ledger.record_fill(
+            self._ledger_db, symbol, "sell", qty, limit_price, notional_sell,
+            reason, strategy="spike_sell", order_id=order_id, dry_run=False,
+        )
 
     def _check_earnings_miss(self, symbol: str, gap_pct: float, price: float, source: str) -> bool:
         """Check if this is an earnings-miss negative gap and sell if we hold the position.
@@ -804,6 +832,31 @@ class SpikeStreamScanner:
             for sym, gap, p in to_order:
                 self._place_order(sym, gap, p)
 
+    # ── Session snapshot ──────────────────────────────────────────────────────
+
+    def _snapshot_session_start(self) -> None:
+        """Record equity + reference closes as benchmark at stream startup."""
+        try:
+            from alpaca.trading.client import TradingClient
+            trading = TradingClient(
+                api_key=self.api_key,
+                secret_key=self.secret_key,
+                paper=bool(self.config["alpaca"].get("paper", True)),
+            )
+            account = trading.get_account()
+            _ledger.record_equity(
+                self._ledger_db,
+                cash=float(getattr(account, "cash", 0) or 0),
+                position_market_value=float(getattr(account, "long_market_value", 0) or 0),
+                total_equity=float(getattr(account, "equity", 0) or 0),
+                unrealized_pnl=float(getattr(account, "unrealized_pl", 0) or 0),
+            )
+        except Exception as exc:
+            log.warning("Could not record equity snapshot: %s", exc)
+
+        if self._reference_closes:
+            _ledger.record_benchmark(self._ledger_db, dict(self._reference_closes))
+
     # ── Entry point ───────────────────────────────────────────────────────────
 
     def run(self, execute: bool = False) -> None:
@@ -846,6 +899,7 @@ class SpikeStreamScanner:
 
             # Layer 1: check for pre-existing gaps before the first trade arrives
             self._startup_gap_scan()
+            self._snapshot_session_start()
 
             async def _watchdog() -> None:
                 while True:
