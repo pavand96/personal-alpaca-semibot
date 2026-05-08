@@ -756,15 +756,21 @@ def rank_adaptive_candidates(
         avg_volume = sum(bar.volume for bar in prior[-20:]) / 20
         volume_ratio = latest.volume / avg_volume if avg_volume > 0 else 1.0
 
+        # Short-term momentum boost (10d) supplements the 21d fast signal
+        short_return = 0.0
+        if len(prior) >= 12 and prior[-11].close > 0:
+            short_return = ((latest.close / prior[-11].close) - 1) * 100
+
         # 52-week high proximity: stocks near/at new highs continue to outperform
         lookback_high = max(b.close for b in prior[-min(252, len(prior)):])
         high_proximity = latest.close / lookback_high if lookback_high > 0 else 1.0
 
-        # Base score: slow momentum + fast momentum + volume confirmation + sector tailwind
-        # + bonus for being near 52-week high (strong momentum continuation signal)
+        # Base score: slow momentum + fast momentum + short-term boost
+        # + volume confirmation + sector tailwind + 52w-high proximity
         score = (
             slow_return * 0.9
             + fast_return * 1.8
+            + short_return * 0.6
             + min(volume_ratio, 3.0) * 2.0
             + sector_return * 0.5
             + (high_proximity - 0.8) * 15.0
