@@ -113,18 +113,18 @@ Inspect the latest model probabilities:
 python main.py ml-signal
 ```
 
-Run a dry-run ML trading check:
+Run a dry-run adaptive trading check, which is the default live strategy:
 
 ```bash
-python main.py ml-trade-once
+python main.py trade-once
 ```
 
-Live ML buys are filtered through the stricter intraday quality gate: at least 1% above the open, above VWAP, at least 1.5x relative volume, not already more than 4% above the open, and no existing position in that symbol. The news filter blocks configured negative keywords; for paper testing it defaults to fail-open when the news API is unavailable.
+The default live path uses the adaptive semi allocator: it ranks the semiconductor watchlist, applies market/risk-off context, buzz/earnings awareness, stop logic, and portfolio exposure caps before submitting any order. The separate ML command remains available for signal inspection and research.
 
 To allow paper orders, keep `alpaca.paper: true`, set `risk.dry_run: false`, and pass `--execute`:
 
 ```bash
-python main.py ml-trade-once --execute
+python main.py trade-once --execute
 ```
 
 ## Continuous Daily Monitoring

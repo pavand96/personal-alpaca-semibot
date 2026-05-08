@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Daily market-aware ML trade runner.
+# Daily adaptive semi strategy runner.
 #
 # Phase 1 — dry-run observation:  2026-05-08 → 2026-06-05  (20 trading days)
 # Phase 2 — paper execution:      2026-06-08 → 2026-07-07  (20 trading days)
@@ -18,7 +18,7 @@ PAPER_START="2026-06-08"
 PAPER_END="2026-07-07"
 
 TODAY="$(date +%F)"
-LOG_FILE="${PROJECT_DIR}/logs/ml_trade_${TODAY}.log"
+LOG_FILE="${PROJECT_DIR}/logs/adaptive_trade_${TODAY}.log"
 
 mkdir -p "${PROJECT_DIR}/logs"
 cd "$PROJECT_DIR"
@@ -51,13 +51,10 @@ else
     EXECUTE_FLAG="--execute"
 fi
 
-log "INFO  $PHASE"
+log "INFO  $PHASE adaptive-semis live strategy"
 
-# Print current signals first so the log shows what the model sees.
-.venv/bin/python main.py ml-signal >> "$LOG_FILE" 2>&1
-
-# Run the strategy. ml-trade-once now blocks fresh buys during risk-off market context.
+# Run the adaptive semi strategy.
 # shellcheck disable=SC2086
-.venv/bin/python main.py ml-trade-once $EXECUTE_FLAG >> "$LOG_FILE" 2>&1
+.venv/bin/python main.py trade-once $EXECUTE_FLAG >> "$LOG_FILE" 2>&1
 
 log "INFO  done"
