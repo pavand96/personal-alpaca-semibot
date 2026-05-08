@@ -264,11 +264,11 @@ def validate_config(config: dict[str, Any]) -> None:
         "stop_loss_pct",
         "trailing_stop_pct",
         "max_account_drawdown_pct",
-        "max_daily_loss_pct",
         "max_total_position_notional",
         "take_profit_pct",
     ]:
         require_positive(config["risk"], key)
+    require_non_negative(config["risk"], "max_daily_loss_pct")
     validate_hhmm(config["risk"], "exit_before_close")
 
     order_type = str(config["orders"].get("type", "market")).lower()

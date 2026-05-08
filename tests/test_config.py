@@ -67,3 +67,17 @@ risk:
 
     with pytest.raises(ValueError, match="exit_before_close must be HH:MM"):
         load_config(config_path)
+
+
+def test_load_config_accepts_max_daily_loss_pct_zero(tmp_path) -> None:
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        """
+risk:
+  max_daily_loss_pct: 0
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+    assert config["risk"]["max_daily_loss_pct"] == 0

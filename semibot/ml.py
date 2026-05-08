@@ -503,18 +503,19 @@ class MLStrategy:
 
         dry_run = bool(self.config["risk"]["dry_run"]) or not execute
         max_orders = int(self.config["risk"]["max_orders_per_run"])
-        per_trade_notional = float(self.config["strategy"]["per_trade_notional"])
-        max_position_notional = float(self.config["strategy"]["max_position_notional"])
+        ml_settings = self.config["ml"]
+        per_trade_notional = float(ml_settings.get("per_trade_notional", self.config["strategy"]["per_trade_notional"]))
+        max_position_notional = float(ml_settings.get("max_position_notional", self.config["strategy"]["max_position_notional"]))
         max_total_position_notional = float(self.config["risk"].get("max_total_position_notional", 10000.0))
         total_position_notional = sum(
             abs(float(getattr(position, "market_value", 0.0) or 0.0))
             for position in positions.values()
         )
-        max_buys = int(self.config["strategy"]["max_symbols_to_buy_per_run"])
-        buy_probability = float(self.config["ml"]["buy_probability"])
-        sell_probability = float(self.config["ml"]["sell_probability"])
-        stop_loss_pct = float(self.config["risk"]["stop_loss_pct"])
-        take_profit_pct = float(self.config["risk"].get("take_profit_pct", 1.0))
+        max_buys = int(ml_settings.get("max_symbols_to_buy_per_run", self.config["strategy"]["max_symbols_to_buy_per_run"]))
+        buy_probability = float(ml_settings["buy_probability"])
+        sell_probability = float(ml_settings["sell_probability"])
+        stop_loss_pct = float(ml_settings.get("stop_loss_pct", self.config["risk"]["stop_loss_pct"]))
+        take_profit_pct = float(ml_settings.get("take_profit_pct", self.config["risk"].get("take_profit_pct", 1.0)))
         exit_before_close = parse_hhmm_time(str(self.config["risk"].get("exit_before_close", "15:55")))
         now_et = datetime.now(MARKET_TZ).time()
         should_exit_for_close = now_et >= exit_before_close

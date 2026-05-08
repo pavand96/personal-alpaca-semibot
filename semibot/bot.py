@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -206,7 +207,7 @@ class SemiMomentumBot:
             limit_price = limit_price_for_side(reference_price, decision.action, offset_bps)
             request_kwargs["limit_price"] = limit_price
             if decision.action == "buy":
-                request_kwargs["qty"] = round(decision.notional / limit_price, 6)
+                request_kwargs["qty"] = math.floor(decision.notional / limit_price * 1_000_000) / 1_000_000
             else:
                 request_kwargs["qty"] = decision.qty
             order = LimitOrderRequest(**request_kwargs)
