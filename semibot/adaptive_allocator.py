@@ -152,6 +152,11 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
         use_relative_strength = bool(settings.get("use_relative_strength", False))
         use_trend_consistency = bool(settings.get("use_trend_consistency", False))
         score_proportional_sizing = bool(settings.get("score_proportional_sizing", False))
+        bull_exposure_pct = float(settings.get("bull_exposure_pct", 0.0))
+        bull_max_symbols = int(settings.get("bull_max_symbols", max_symbols))
+        bull_sector_min_return = float(settings.get("bull_sector_min_return_pct", 0.0))
+        atr_sizing_enabled = bool(settings.get("atr_sizing_enabled", False))
+        atr_lookback_days = int(settings.get("atr_lookback_days", 14))
 
         max_lookback = max(
             fast_lookback,
@@ -163,6 +168,7 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
             market_sma_days,
             regime_sma_slow if regime_filter_enabled else 0,
             symbol_sma_filter_days,
+            atr_lookback_days + 1,
             50,
             30,
         )
@@ -229,7 +235,14 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
             settings=overlay_settings,
         )
         bear_blocked = regime_filter_enabled and regime == MarketRegime.BEAR and bear_block_entries
-        selected = [] if (risk_off or bear_blocked) else candidates[:max_symbols]
+        live_use_full_bull = (
+            regime_filter_enabled
+            and regime == MarketRegime.BULL
+            and bull_exposure_pct > 0
+            and sector_return >= bull_sector_min_return
+        )
+        effective_max_symbols_live = bull_max_symbols if live_use_full_bull else max_symbols
+        selected = [] if (risk_off or bear_blocked) else candidates[:effective_max_symbols_live]
         target_symbols = {candidate.symbol for candidate in selected}
 
         decisions: list[Decision] = []
@@ -291,9 +304,14 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
         account = bot.trading.get_account()
         equity = float(getattr(account, "equity", 0.0) or 0.0)
         buying_power = float(getattr(account, "buying_power", 0.0) or 0.0)
-        regime_mult = neutral_sizing_pct if (regime_filter_enabled and regime == MarketRegime.NEUTRAL) else 1.0
-        total_pool = min(max_total_exposure, equity) * regime_mult
-        if score_proportional_sizing and len(selected) > 1:
+        if live_use_full_bull:
+            total_pool = equity * bull_exposure_pct
+        else:
+            regime_mult = neutral_sizing_pct if (regime_filter_enabled and regime == MarketRegime.NEUTRAL) else 1.0
+            total_pool = min(max_total_exposure, equity) * regime_mult
+        if atr_sizing_enabled:
+            alloc_weights = compute_atr_weights(selected, bars_by_symbol, current_date, atr_lookback_days)
+        elif score_proportional_sizing and len(selected) > 1:
             min_score = min(c.score for c in selected)
             adj_scores = [c.score - min_score + 1.0 for c in selected]
             total_adj = sum(adj_scores)
@@ -369,6 +387,12 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
         use_relative_strength = bool(settings.get("use_relative_strength", False))
         use_trend_consistency = bool(settings.get("use_trend_consistency", False))
         score_proportional_sizing = bool(settings.get("score_proportional_sizing", False))
+        bull_exposure_pct = float(settings.get("bull_exposure_pct", 0.0))
+        bull_max_symbols = int(settings.get("bull_max_symbols", max_symbols))
+        rebalance_days_bull = int(settings.get("rebalance_days_bull", rebalance_days))
+        bull_sector_min_return = float(settings.get("bull_sector_min_return_pct", 0.0))
+        atr_sizing_enabled = bool(settings.get("atr_sizing_enabled", False))
+        atr_lookback_days = int(settings.get("atr_lookback_days", 14))
 
         max_lookback = max(
             fast_lookback,
@@ -380,6 +404,7 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
             market_sma_days,
             regime_sma_slow if regime_filter_enabled else 0,
             symbol_sma_filter_days,
+            atr_lookback_days + 1,
             50,
             30,
         )
@@ -464,7 +489,15 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
                     continue
                 position.peak_price = max(position.peak_price, bar.high)
 
-            should_rebalance = day_index - last_rebalance_index >= rebalance_days
+            use_full_bull = (
+                regime_filter_enabled
+                and regime == MarketRegime.BULL
+                and bull_exposure_pct > 0
+                and sector_return >= bull_sector_min_return
+            )
+            effective_rebalance_days = rebalance_days_bull if use_full_bull else rebalance_days
+            effective_max_symbols = bull_max_symbols if use_full_bull else max_symbols
+            should_rebalance = day_index - last_rebalance_index >= effective_rebalance_days
             if should_rebalance:
                 candidates = rank_adaptive_candidates(
                     bars_by_symbol=bars_by_symbol,
@@ -537,11 +570,17 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
                         ),
                     )
 
-                selected = candidates[:max_symbols] if not (risk_off or bear_blocked) else []
+                selected = candidates[:effective_max_symbols] if not (risk_off or bear_blocked) else []
                 if selected:
-                    regime_mult = neutral_sizing_pct if (regime_filter_enabled and regime == MarketRegime.NEUTRAL) else 1.0
-                    total_pool = min(max_total_exposure, cash + market_value(positions, today_bars)) * regime_mult
-                    if score_proportional_sizing and len(selected) > 1:
+                    equity_now = cash + market_value(positions, today_bars)
+                    if use_full_bull:
+                        total_pool = equity_now * bull_exposure_pct
+                    else:
+                        regime_mult = neutral_sizing_pct if (regime_filter_enabled and regime == MarketRegime.NEUTRAL) else 1.0
+                        total_pool = min(max_total_exposure, equity_now) * regime_mult
+                    if atr_sizing_enabled:
+                        alloc_weights = compute_atr_weights(selected, bars_by_symbol, current_date, atr_lookback_days)
+                    elif score_proportional_sizing and len(selected) > 1:
                         min_score = min(c.score for c in selected)
                         adj_scores = [c.score - min_score + 1.0 for c in selected]
                         total_adj = sum(adj_scores)
@@ -722,6 +761,36 @@ def rank_adaptive_candidates(
             )
         )
     return sorted(candidates, key=lambda item: item.score, reverse=True)
+
+
+def compute_atr_weights(
+    candidates: list[AdaptiveCandidate],
+    bars_by_symbol: dict[str, list[DailyBar]],
+    current_date: date,
+    atr_days: int,
+) -> list[float]:
+    """Inverse-ATR weights: lower-volatility symbols receive proportionally more capital."""
+    inv_atrs: list[float] = []
+    for candidate in candidates:
+        bars = bars_by_symbol.get(candidate.symbol, [])
+        prior = [b for b in bars if b.timestamp.date() < current_date]
+        if len(prior) < atr_days + 1:
+            inv_atrs.append(1.0)
+            continue
+        window = prior[-(atr_days + 1):]
+        trs = [
+            max(
+                window[i].high - window[i].low,
+                abs(window[i].high - window[i - 1].close),
+                abs(window[i].low - window[i - 1].close),
+            )
+            for i in range(1, len(window))
+        ]
+        atr = sum(trs) / atr_days
+        atr_pct = atr / window[-1].close if window[-1].close > 0 else 1.0
+        inv_atrs.append(1.0 / max(atr_pct, 0.001))
+    total = sum(inv_atrs)
+    return [v / total for v in inv_atrs] if total > 0 else [1.0 / len(candidates)] * len(candidates)
 
 
 def sector_return_pct(

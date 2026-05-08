@@ -432,6 +432,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "use_relative_strength": True,
         "use_trend_consistency": True,
         "score_proportional_sizing": True,
+        "bull_exposure_pct": 0.80,
+        "bull_max_symbols": 5,
+        "rebalance_days_bull": 3,
+        "atr_sizing_enabled": True,
+        "atr_lookback_days": 14,
         "trades_file": "logs/adaptive_semis_trades.csv",
     },
 }
