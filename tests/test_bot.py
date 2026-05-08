@@ -147,3 +147,23 @@ def test_floor_order_qty_is_strictly_floored_when_rounding_would_round_up() -> N
     qty = floor_order_qty(100.0, price)
     assert qty <= round(100.0 / price, 6)
     assert qty * price <= 100.0 + 1e-6
+
+
+def test_floor_order_qty_raises_for_zero_notional() -> None:
+    with pytest.raises(ValueError, match="notional"):
+        floor_order_qty(0.0, 100.0)
+
+
+def test_floor_order_qty_raises_for_negative_notional() -> None:
+    with pytest.raises(ValueError, match="notional"):
+        floor_order_qty(-50.0, 100.0)
+
+
+def test_floor_order_qty_raises_for_zero_price() -> None:
+    with pytest.raises(ValueError, match="price"):
+        floor_order_qty(100.0, 0.0)
+
+
+def test_floor_order_qty_raises_for_negative_price() -> None:
+    with pytest.raises(ValueError, match="price"):
+        floor_order_qty(100.0, -1.0)

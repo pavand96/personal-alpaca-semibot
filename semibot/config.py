@@ -253,6 +253,7 @@ def validate_config(config: dict[str, Any]) -> None:
     require_positive(config["strategy"], "max_position_notional")
     if float(config["strategy"]["per_trade_notional"]) > float(config["strategy"]["max_position_notional"]):
         raise ValueError("strategy.per_trade_notional cannot exceed strategy.max_position_notional")
+    # 0 is valid: means sell-only mode (existing positions can be sold, no new buys)
     require_non_negative(config["strategy"], "max_symbols_to_buy_per_run")
     require_positive(config["strategy"], "min_price")
     require_positive(config["strategy"], "max_price")
@@ -276,10 +277,22 @@ def validate_config(config: dict[str, Any]) -> None:
         if key in ml:
             require_positive(ml, key)
     if "max_symbols_to_buy_per_run" in ml:
+        # 0 is valid: means sell-only mode (existing positions can be sold, no new buys)
         require_non_negative(ml, "max_symbols_to_buy_per_run")
     if "per_trade_notional" in ml and "max_position_notional" in ml:
         if float(ml["per_trade_notional"]) > float(ml["max_position_notional"]):
             raise ValueError("ml.per_trade_notional cannot exceed ml.max_position_notional")
+    for key in ("buy_probability", "sell_probability"):
+        if key in ml:
+            val = float(ml[key])
+            if not 0.0 <= val <= 1.0:
+                raise ValueError(f"ml.{key} must be between 0 and 1, got {val}")
+    if "buy_probability" in ml and "sell_probability" in ml:
+        if float(ml["buy_probability"]) < float(ml["sell_probability"]):
+            raise ValueError(
+                "ml.buy_probability must be >= ml.sell_probability "
+                f"(got buy={ml['buy_probability']}, sell={ml['sell_probability']})"
+            )
 
     order_type = str(config["orders"].get("type", "market")).lower()
     if order_type not in {"market", "limit"}:

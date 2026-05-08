@@ -110,3 +110,61 @@ risk:
 
     config = load_config(config_path)
     assert config["risk"]["max_daily_loss_pct"] == 0
+
+
+def test_load_config_rejects_buy_probability_above_1(tmp_path) -> None:
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        """
+ml:
+  buy_probability: 1.5
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="buy_probability must be between 0 and 1"):
+        load_config(config_path)
+
+
+def test_load_config_rejects_sell_probability_below_0(tmp_path) -> None:
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        """
+ml:
+  sell_probability: -0.1
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="sell_probability must be between 0 and 1"):
+        load_config(config_path)
+
+
+def test_load_config_rejects_buy_probability_less_than_sell_probability(tmp_path) -> None:
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        """
+ml:
+  buy_probability: 0.30
+  sell_probability: 0.50
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="buy_probability must be >= ml.sell_probability"):
+        load_config(config_path)
+
+
+def test_load_config_accepts_max_symbols_to_buy_per_run_zero(tmp_path) -> None:
+    # 0 means sell-only mode: existing positions can be sold, no new buys
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        """
+strategy:
+  max_symbols_to_buy_per_run: 0
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+    assert config["strategy"]["max_symbols_to_buy_per_run"] == 0

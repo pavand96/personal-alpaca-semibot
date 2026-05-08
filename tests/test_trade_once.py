@@ -2,12 +2,11 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from semibot.bot import Decision, MarketView, SemiMomentumBot
-
+from semibot.bot import Decision, SemiMomentumBot
 
 # ---------------------------------------------------------------------------
 # Fixtures / helpers
@@ -250,3 +249,68 @@ def test_trade_once_raises_when_trading_blocked() -> None:
 
     with pytest.raises(RuntimeError, match="trading blocked"):
         bot.trade_once()
+
+
+# ---------------------------------------------------------------------------
+# Kill-switch execute path (dry_run=False, execute=True)
+# ---------------------------------------------------------------------------
+
+def test_trade_once_kill_switch_calls_submit_order_for_every_position() -> None:
+    # execute=True + dry_run=False: submit_order must be called once per held position,
+    # regardless of max_orders_per_run, because is_flatten bypasses the cap.
+    bot = make_bot(risk={"max_daily_loss_pct": 3.0, "max_orders_per_run": 1, "flatten_on_daily_loss": True, "dry_run": False})
+    bot.trading.get_account.return_value = SimpleNamespace(
+        equity="9400", last_equity="10000", trading_blocked=False, account_blocked=False
+    )
+    held = [SimpleNamespace(symbol=s, qty="1.0") for s in ["NVDA", "AMD", "AVGO"]]
+    bot.trading.get_all_positions.return_value = held
+    bot.trading.submit_order.return_value = SimpleNamespace(id="order-123")
+
+    with patch.object(bot, "log_decision"):
+        result = bot.trade_once(execute=True)
+
+    assert len(result) == 3
+    assert bot.trading.submit_order.call_count == 3
+
+
+# ---------------------------------------------------------------------------
+# max_symbols_to_buy_per_run: 0 (sell-only mode)
+# ---------------------------------------------------------------------------
+
+def test_trade_once_zero_max_buys_produces_no_buy_decisions() -> None:
+    from semibot.bot import MarketView
+
+    bot = make_bot(strategy={"max_symbols_to_buy_per_run": 0})
+    # NVDA: +3% momentum signal (above buy_threshold=2%), but max_buys=0 blocks it
+    # AMD: held, +2% (above sell_threshold=-1%), so no sell either
+    views = [
+        MarketView("NVDA", 103.0, 100.0, 3.0, 0.0, 0.0),
+        MarketView("AMD", 102.0, 100.0, 2.0, 1.0, 100.0),
+    ]
+
+    with (
+        patch.object(bot, "get_market_views", return_value=views),
+        patch.object(bot, "log_decision"),
+    ):
+        result = bot.trade_once()
+
+    buy_results = [d for d in result if d.action == "buy"]
+    assert len(buy_results) == 0
+
+
+def test_trade_once_zero_max_buys_still_allows_sell_decisions() -> None:
+    bot = make_bot(strategy={"max_symbols_to_buy_per_run": 0})
+    # AMD held, -3% change → below sell_threshold (-1%) → should sell despite max_buys=0
+    with (
+        patch.object(
+            bot,
+            "decide",
+            return_value=[Decision("AMD", "sell", "change -3.00% <= sell threshold -1.00%", qty=1.0)],
+        ),
+        patch.object(bot, "get_market_views", return_value=[]),
+        patch.object(bot, "log_decision"),
+    ):
+        result = bot.trade_once()
+
+    assert len(result) == 1
+    assert result[0].action == "sell"

@@ -307,7 +307,10 @@ def account_daily_return_pct(account: Any) -> float:
 
 
 def floor_order_qty(notional: float, price: float) -> float:
-    """Floor fractional share quantity to 6 decimal places to avoid spending over notional."""
+    if notional <= 0:
+        raise ValueError(f"notional must be positive, got {notional}")
+    if price <= 0:
+        raise ValueError(f"price must be positive, got {price}")
     return math.floor(notional / price * 1_000_000) / 1_000_000
 
 

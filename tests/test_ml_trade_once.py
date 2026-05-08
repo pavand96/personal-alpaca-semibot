@@ -5,10 +5,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from semibot.ml import MLSignal, MLStrategy
-
 
 # ---------------------------------------------------------------------------
 # Fixtures / helpers
