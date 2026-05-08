@@ -391,6 +391,7 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
         bull_max_symbols = int(settings.get("bull_max_symbols", max_symbols))
         rebalance_days_bull = int(settings.get("rebalance_days_bull", rebalance_days))
         bull_sector_min_return = float(settings.get("bull_sector_min_return_pct", 0.0))
+        bull_drawdown_cap = float(settings.get("bull_drawdown_cap_pct", 0.0)) / 100
         atr_sizing_enabled = bool(settings.get("atr_sizing_enabled", False))
         atr_lookback_days = int(settings.get("atr_lookback_days", 14))
 
@@ -489,11 +490,15 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
                     continue
                 position.peak_price = max(position.peak_price, bar.high)
 
+            current_equity = cash + market_value(positions, today_bars)
+            portfolio_dd = (current_equity / peak_equity - 1) if peak_equity > 0 else 0.0
+            drawdown_breaker_tripped = bull_drawdown_cap > 0 and portfolio_dd <= -bull_drawdown_cap
             use_full_bull = (
                 regime_filter_enabled
                 and regime == MarketRegime.BULL
                 and bull_exposure_pct > 0
                 and sector_return >= bull_sector_min_return
+                and not drawdown_breaker_tripped
             )
             effective_rebalance_days = rebalance_days_bull if use_full_bull else rebalance_days
             effective_max_symbols = bull_max_symbols if use_full_bull else max_symbols
@@ -572,12 +577,11 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
 
                 selected = candidates[:effective_max_symbols] if not (risk_off or bear_blocked) else []
                 if selected:
-                    equity_now = cash + market_value(positions, today_bars)
                     if use_full_bull:
-                        total_pool = equity_now * bull_exposure_pct
+                        total_pool = current_equity * bull_exposure_pct
                     else:
                         regime_mult = neutral_sizing_pct if (regime_filter_enabled and regime == MarketRegime.NEUTRAL) else 1.0
-                        total_pool = min(max_total_exposure, equity_now) * regime_mult
+                        total_pool = min(max_total_exposure, current_equity) * regime_mult
                     if atr_sizing_enabled:
                         alloc_weights = compute_atr_weights(selected, bars_by_symbol, current_date, atr_lookback_days)
                     elif score_proportional_sizing and len(selected) > 1:
