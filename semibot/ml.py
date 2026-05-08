@@ -33,6 +33,7 @@ from semibot.backtest import (
 )
 from semibot.bot import Decision, SemiMomentumBot, format_decision
 from semibot.intraday import MARKET_TZ, SESSION_OPEN, calculate_vwap, is_regular_session
+from semibot.market_context import MarketContext, build_market_context
 
 NUMERIC_FEATURES = [
     "return_1d",
@@ -738,6 +739,8 @@ class MLStrategy:
         exit_before_close = parse_hhmm_time(str(self.config["risk"].get("exit_before_close", "15:55")))
         now_et = datetime.now(MARKET_TZ).time()
         should_exit_for_close = now_et >= exit_before_close
+        market_context = self.live_market_context()
+        print(f"ML market context: {market_context.summary()}")
 
         decisions: list[Decision] = []
         risk_sell_symbols: set[str] = set()
@@ -810,6 +813,7 @@ class MLStrategy:
                 signal.probability >= buy_probability
                 and quality_passed
                 and news_passed
+                and not market_context.risk_off
                 and held_qty <= 0
                 and held_value + per_trade_notional <= max_position_notional
                 and total_position_notional + queued_buy_notional + per_trade_notional <= max_total_position_notional
@@ -831,6 +835,8 @@ class MLStrategy:
                 )
             elif signal.probability >= buy_probability and held_qty <= 0 and not news_passed:
                 decisions.append(Decision(signal.symbol, "hold", news_reason))
+            elif signal.probability >= buy_probability and held_qty <= 0 and market_context.risk_off:
+                decisions.append(Decision(signal.symbol, "hold", f"market context blocked entry: {market_context.summary()}"))
             elif (
                 signal.probability >= buy_probability
                 and total_position_notional + queued_buy_notional + per_trade_notional > max_total_position_notional
@@ -848,6 +854,16 @@ class MLStrategy:
         if not submitted:
             print("No ML trade signals crossed the configured probability thresholds.")
         return submitted
+
+    def live_market_context(self) -> MarketContext:
+        try:
+            return build_market_context(self.config, api_key=self.api_key, secret_key=self.secret_key)
+        except Exception as error:
+            current_date = datetime.now(MARKET_TZ).date()
+            return MarketContext.neutral(
+                current_date,
+                f"market context unavailable ({type(error).__name__}); fail open",
+            )
 
     def live_entry_quality(self, symbols: list[str]) -> dict[str, tuple[bool, str]]:
         settings = self.config.get("live_entry_filter", {})

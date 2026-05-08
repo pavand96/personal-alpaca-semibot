@@ -1,15 +1,25 @@
 """Tests for MLStrategy.ml_trade_once() — the live entry point for the ML strategy."""
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
+from semibot.market_context import MarketContext
 from semibot.ml import MLSignal, MLStrategy
 
 # ---------------------------------------------------------------------------
 # Fixtures / helpers
 # ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _neutral_market_context():
+    context = MarketContext.neutral(date(2026, 1, 2), "market context allows entries")
+    with patch("semibot.ml.build_market_context", return_value=context):
+        yield
+
 
 def make_strategy(
     risk: dict | None = None,
@@ -336,7 +346,7 @@ def test_ml_trade_once_take_profit_sells_when_gain_exceeds_threshold() -> None:
 # ---------------------------------------------------------------------------
 
 def test_ml_trade_once_exit_before_close_sells_all_positions() -> None:
-    strategy = make_strategy(risk={"exit_before_close": "09:00"})  # always past threshold
+    strategy = make_strategy(risk={"exit_before_close": "00:00"})  # always past threshold
     held = {"NVDA": _position("NVDA"), "AMD": _position("AMD")}
     fake_bot = _make_fake_bot(positions=held)
 
@@ -450,6 +460,37 @@ def test_ml_trade_once_quality_filter_failure_produces_hold() -> None:
     buy_decisions = [d for d in captured if d.action == "buy"]
     assert len(hold_decisions) == 1
     assert len(buy_decisions) == 0
+
+
+def test_ml_trade_once_market_context_blocks_new_buy() -> None:
+    strategy = make_strategy()
+    fake_bot = _make_fake_bot()
+    captured: list = []
+    risk_off_context = MarketContext(
+        as_of_date=date(2026, 1, 2),
+        risk_off=True,
+        market_ok=False,
+        sector_return_pct=-6.0,
+        sector_slow_return_pct=-2.0,
+        sector_drawdown_pct=-12.0,
+        reasons=("market proxy trend blocked entries",),
+    )
+
+    def capturing_submit(bot, decisions, dry_run, max_orders):
+        captured.extend(decisions)
+        return [d for d in decisions if d.action != "hold"]
+
+    with (
+        patch("semibot.ml.SemiMomentumBot", return_value=fake_bot),
+        patch("semibot.ml.build_market_context", return_value=risk_off_context),
+        patch.object(strategy, "latest_signals", return_value=[_signal("NVDA")]),
+        patch.object(strategy, "live_entry_quality", return_value={"NVDA": (True, "ok")}),
+        patch("semibot.ml.submit_ml_decisions", side_effect=capturing_submit),
+    ):
+        strategy.ml_trade_once()
+
+    assert [decision.action for decision in captured] == ["hold"]
+    assert "market context blocked entry" in captured[0].reason
 
 
 def test_ml_trade_once_news_keyword_blocks_buy() -> None:

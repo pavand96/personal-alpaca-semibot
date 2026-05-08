@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from alpaca.data.historical import NewsClient
-from alpaca.data.requests import NewsRequest
+from alpaca.data.requests import NewsRequest, StockSnapshotRequest
 
 from semibot.backtest import (
     Backtester,
@@ -20,6 +20,8 @@ from semibot.backtest import (
     print_backtest_result,
     write_trades_csv,
 )
+from semibot.bot import Decision, SemiMomentumBot, format_decision
+from semibot.intraday import MARKET_TZ
 
 
 @dataclass(frozen=True)
@@ -40,6 +42,218 @@ class BuzzSnapshot:
 
 
 class AdaptiveSemiPortfolioBacktester(Backtester):
+    def trade_once(self, execute: bool = False) -> list[Decision]:
+        bot = SemiMomentumBot(self.config, api_key=self.api_key, secret_key=self.secret_key)
+        bot.assert_account_can_trade()
+        if self.config["risk"]["require_market_open"] and not bot.trading.get_clock().is_open:  # type: ignore[union-attr]
+            print("Market is closed. No adaptive orders submitted.")
+            return []
+
+        positions = bot.get_positions()
+        if bot.daily_loss_kill_switch_triggered():
+            if self.config["risk"].get("flatten_on_daily_loss", True):
+                decisions = [
+                    Decision(position.symbol, "sell", "daily loss kill switch", qty=float(position.qty))
+                    for position in positions.values()
+                    if float(position.qty) > 0
+                ]
+                return submit_adaptive_decisions(
+                    bot=bot,
+                    decisions=decisions,
+                    dry_run=bool(self.config["risk"]["dry_run"]) or not execute,
+                    max_orders=len(decisions),
+                )
+            print("Daily loss kill switch active. No adaptive orders submitted.")
+            return []
+
+        decisions = self.live_decisions(bot=bot, positions=positions)
+        submitted = submit_adaptive_decisions(
+            bot=bot,
+            decisions=decisions,
+            dry_run=bool(self.config["risk"]["dry_run"]) or not execute,
+            max_orders=int(self.config["risk"]["max_orders_per_run"]),
+        )
+        if not submitted:
+            print("No adaptive trade signals.")
+        return submitted
+
+    def live_decisions(self, bot: SemiMomentumBot, positions: dict[str, Any]) -> list[Decision]:
+        settings = self.config["adaptive_semis_allocator"]
+        overlay_settings = self.config.get("buzz_earnings_overlay", {})
+        current_date = datetime.now(MARKET_TZ).date()
+
+        max_symbols = int(settings["max_symbols"])
+        max_total_exposure = float(settings["max_total_exposure"])
+        fast_lookback = int(settings["fast_momentum_days"])
+        slow_lookback = int(settings["momentum_lookback_days"])
+        sector_lookback = int(settings["sector_lookback_days"])
+        sector_slow_lookback = int(settings["sector_slow_lookback_days"])
+        sector_drawdown_lookback = int(settings["sector_drawdown_lookback_days"])
+        min_sector_return = float(settings["min_sector_return_pct"])
+        min_sector_slow_return = float(settings["min_sector_slow_return_pct"])
+        risk_off_sector_return = float(settings["risk_off_sector_return_pct"])
+        max_sector_drawdown = float(settings["max_sector_drawdown_pct"])
+        risk_filter_symbols = [str(symbol).upper() for symbol in settings.get("risk_filter_symbols", [])]
+        market_momentum_lookback = int(settings["market_momentum_lookback_days"])
+        market_sma_days = int(settings["market_sma_days"])
+        min_market_momentum = float(settings["min_market_momentum_pct"])
+        require_market_above_sma = bool(settings["require_market_above_sma"])
+        min_symbol_return = float(settings["min_symbol_momentum_pct"])
+        min_trade_notional = float(settings["min_trade_notional"])
+        retain_winners = bool(settings["retain_winners"])
+        retain_min_profit_pct = float(settings["retain_min_profit_pct"])
+        retain_min_fast_momentum_pct = float(settings["retain_min_fast_momentum_pct"])
+        retain_min_slow_momentum_pct = float(settings["retain_min_slow_momentum_pct"])
+        hard_stop_pct = float(settings["hard_stop_pct"])
+
+        max_lookback = max(
+            fast_lookback,
+            slow_lookback,
+            sector_lookback,
+            sector_slow_lookback,
+            sector_drawdown_lookback,
+            market_momentum_lookback,
+            market_sma_days,
+            30,
+        )
+        fetch_start = current_date - timedelta(days=max_lookback * 3)
+        bars_by_symbol = self.fetch_daily_bars(self.config["watchlist"], fetch_start, current_date)
+        risk_bars_by_symbol = self.fetch_daily_bars(risk_filter_symbols, fetch_start, current_date) if risk_filter_symbols else {}
+        latest_prices = fetch_live_prices(bot, self.config["watchlist"])
+        overlay_bars = live_overlay_bars(bars_by_symbol=bars_by_symbol, prices=latest_prices, current_date=current_date)
+        overlay_positions = backtest_positions_from_live(self.config["watchlist"], positions)
+
+        news_by_symbol = fetch_news_by_symbol(
+            api_key=self.api_key,
+            secret_key=self.secret_key,
+            symbols=self.config["watchlist"],
+            start=current_date - timedelta(days=int(overlay_settings.get("news_lookback_days", 7))),
+            end=current_date,
+            settings=overlay_settings,
+        )
+        earnings_by_symbol = load_earnings_calendar(overlay_settings.get("earnings_calendar_file"))
+
+        sector_return = sector_return_pct(bars_by_symbol, current_date, sector_lookback)
+        sector_slow_return = sector_return_pct(bars_by_symbol, current_date, sector_slow_lookback)
+        sector_drawdown = sector_drawdown_pct(bars_by_symbol, current_date, sector_drawdown_lookback)
+        market_ok = market_filter_allows_entries(
+            bars_by_symbol=risk_bars_by_symbol,
+            current_date=current_date,
+            momentum_lookback=market_momentum_lookback,
+            sma_days=market_sma_days,
+            min_momentum_pct=min_market_momentum,
+            require_above_sma=require_market_above_sma,
+        )
+        risk_off = (
+            sector_return <= risk_off_sector_return
+            or sector_slow_return < min_sector_slow_return
+            or sector_drawdown <= max_sector_drawdown
+            or not market_ok
+        )
+
+        candidates = rank_adaptive_candidates(
+            bars_by_symbol=bars_by_symbol,
+            current_date=current_date,
+            fast_lookback=fast_lookback,
+            slow_lookback=slow_lookback,
+            sector_lookback=sector_lookback,
+            min_sector_return=min_sector_return,
+            min_symbol_return=min_symbol_return,
+        )
+        candidates = apply_buzz_earnings_overlay(
+            candidates=candidates,
+            current_date=current_date,
+            positions=overlay_positions,
+            today_bars=overlay_bars,
+            news_by_symbol=news_by_symbol,
+            earnings_by_symbol=earnings_by_symbol,
+            settings=overlay_settings,
+        )
+        selected = [] if risk_off else candidates[:max_symbols]
+        target_symbols = {candidate.symbol for candidate in selected}
+
+        decisions: list[Decision] = []
+        held_symbols = set()
+        for symbol in self.config["watchlist"]:
+            position = positions.get(symbol)
+            if not position:
+                continue
+            qty = float(getattr(position, "qty", 0.0) or 0.0)
+            if qty <= 0:
+                continue
+            held_symbols.add(symbol)
+            current_price = latest_prices.get(symbol)
+            unrealized_plpc = float(getattr(position, "unrealized_plpc", 0.0) or 0.0)
+            if unrealized_plpc <= -(hard_stop_pct / 100):
+                decisions.append(
+                    Decision(symbol, "sell", f"adaptive hard stop {unrealized_plpc:.2%} <= -{hard_stop_pct:.2f}%", qty=qty)
+                )
+                continue
+            if risk_off:
+                decisions.append(
+                    Decision(
+                        symbol,
+                        "sell",
+                        (
+                            "adaptive risk-off: "
+                            f"sector={sector_return:.2f}% slow={sector_slow_return:.2f}% "
+                            f"dd={sector_drawdown:.2f}% market_ok={market_ok}"
+                        ),
+                        qty=qty,
+                    )
+                )
+                continue
+            if symbol in target_symbols:
+                continue
+            if (
+                retain_winners
+                and current_price
+                and should_retain_winner(
+                    symbol=symbol,
+                    position=overlay_positions[symbol],
+                    current_price=current_price,
+                    bars_by_symbol=bars_by_symbol,
+                    current_date=current_date,
+                    fast_lookback=fast_lookback,
+                    slow_lookback=slow_lookback,
+                    min_profit_pct=retain_min_profit_pct,
+                    min_fast_momentum_pct=retain_min_fast_momentum_pct,
+                    min_slow_momentum_pct=retain_min_slow_momentum_pct,
+                )
+            ):
+                decisions.append(Decision(symbol, "hold", "adaptive retained winner"))
+                continue
+            decisions.append(Decision(symbol, "sell", "adaptive rebalance out", qty=qty))
+
+        if risk_off or not selected:
+            return decisions
+
+        account = bot.trading.get_account()
+        equity = float(getattr(account, "equity", 0.0) or 0.0)
+        buying_power = float(getattr(account, "buying_power", 0.0) or 0.0)
+        target_notional = min(max_total_exposure, equity) / len(selected)
+        queued_buys = 0.0
+        for candidate in selected:
+            position = positions.get(candidate.symbol)
+            held_value = abs(float(getattr(position, "market_value", 0.0) or 0.0)) if position else 0.0
+            buy_notional = max(0.0, min(target_notional - held_value, buying_power - queued_buys))
+            if buy_notional < min_trade_notional:
+                continue
+            queued_buys += buy_notional
+            decisions.append(
+                Decision(
+                    candidate.symbol,
+                    "buy",
+                    (
+                        f"adaptive target score={candidate.score:.2f}; "
+                        f"sector={sector_return:.2f}% slow={sector_slow_return:.2f}% dd={sector_drawdown:.2f}%"
+                    ),
+                    notional=buy_notional,
+                )
+            )
+
+        return decisions
+
     def run(self, start: date, end: date) -> BacktestResult:
         settings = self.config["adaptive_semis_allocator"]
         overlay_settings = self.config.get("buzz_earnings_overlay", {})
@@ -697,6 +911,90 @@ def sell_position(
     position.avg_entry = 0.0
     position.peak_price = 0.0
     return cash_after
+
+
+def fetch_live_prices(bot: SemiMomentumBot, symbols: list[str]) -> dict[str, float]:
+    snapshots = bot.data.get_stock_snapshot(
+        StockSnapshotRequest(symbol_or_symbols=symbols, feed=bot.feed)
+    )
+    prices: dict[str, float] = {}
+    for symbol in symbols:
+        snapshot = snapshots.get(symbol)
+        latest_trade = getattr(snapshot, "latest_trade", None) if snapshot else None
+        if latest_trade is None:
+            continue
+        prices[symbol] = float(latest_trade.price)
+    return prices
+
+
+def live_overlay_bars(
+    bars_by_symbol: dict[str, list[DailyBar]],
+    prices: dict[str, float],
+    current_date: date,
+) -> dict[str, DailyBar]:
+    bars: dict[str, DailyBar] = {}
+    for symbol, price in prices.items():
+        historical_bars = bars_by_symbol.get(symbol, [])
+        previous = historical_bars[-1] if historical_bars else None
+        volume = previous.volume if previous else 0.0
+        open_price = previous.close if previous else price
+        bars[symbol] = DailyBar(
+            symbol=symbol,
+            timestamp=datetime.combine(current_date, datetime.min.time(), tzinfo=UTC),
+            open=open_price,
+            high=max(open_price, price),
+            low=min(open_price, price),
+            close=price,
+            volume=volume,
+        )
+    return bars
+
+
+def backtest_positions_from_live(
+    watchlist: list[str],
+    positions: dict[str, Any],
+) -> dict[str, BacktestPosition]:
+    mapped = {symbol: BacktestPosition() for symbol in watchlist}
+    for symbol in watchlist:
+        position = positions.get(symbol)
+        if not position:
+            continue
+        qty = float(getattr(position, "qty", 0.0) or 0.0)
+        if qty <= 0:
+            continue
+        avg_entry = float(getattr(position, "avg_entry_price", 0.0) or 0.0)
+        market_value = abs(float(getattr(position, "market_value", 0.0) or 0.0))
+        current_price = market_value / qty if qty > 0 and market_value > 0 else avg_entry
+        mapped[symbol] = BacktestPosition(
+            qty=qty,
+            avg_entry=avg_entry,
+            peak_price=max(avg_entry, current_price),
+        )
+    return mapped
+
+
+def submit_adaptive_decisions(
+    bot: SemiMomentumBot,
+    decisions: list[Decision],
+    dry_run: bool,
+    max_orders: int,
+) -> list[Decision]:
+    submitted: list[Decision] = []
+    for decision in decisions:
+        if len(submitted) >= max_orders:
+            break
+        if decision.action == "hold":
+            print(f"ADAPTIVE HOLD {format_decision(decision)}")
+            bot.log_decision(decision, event="adaptive_hold")
+            continue
+        if dry_run:
+            print(f"ADAPTIVE DRY RUN {format_decision(decision)}")
+            bot.log_decision(decision, event="adaptive_dry_run_order")
+        else:
+            bot.submit_order(decision)
+            bot.log_decision(decision, event="adaptive_submitted_order")
+        submitted.append(decision)
+    return submitted
 
 
 def print_adaptive_allocator_result(result: BacktestResult) -> None:

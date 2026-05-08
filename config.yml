@@ -192,7 +192,7 @@ strategy:
 
 risk:
   # Dry run prints/logs intended orders but does not submit them.
-  dry_run: true
+  dry_run: false
   require_market_open: true
   max_orders_per_run: 3
   # ML strategy fallback only — overridden by ml.stop_loss_pct below.

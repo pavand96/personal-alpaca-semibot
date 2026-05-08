@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Daily ML trade runner.
+# Daily market-aware ML trade runner.
 #
 # Phase 1 — dry-run observation:  2026-05-08 → 2026-06-05  (20 trading days)
 # Phase 2 — paper execution:      2026-06-08 → 2026-07-07  (20 trading days)
@@ -56,7 +56,7 @@ log "INFO  $PHASE"
 # Print current signals first so the log shows what the model sees.
 .venv/bin/python main.py ml-signal >> "$LOG_FILE" 2>&1
 
-# Run the strategy.
+# Run the strategy. ml-trade-once now blocks fresh buys during risk-off market context.
 # shellcheck disable=SC2086
 .venv/bin/python main.py ml-trade-once $EXECUTE_FLAG >> "$LOG_FILE" 2>&1
 
