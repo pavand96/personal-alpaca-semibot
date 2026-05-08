@@ -154,6 +154,14 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
         use_trend_consistency = bool(settings.get("use_trend_consistency", False))
         use_momentum_acceleration = bool(settings.get("use_momentum_acceleration", False))
         momentum_acceleration_weight = float(settings.get("momentum_acceleration_weight", 6.0))
+        slow_momentum_weight = float(settings.get("slow_momentum_weight", 0.9))
+        fast_momentum_weight = float(settings.get("fast_momentum_weight", 1.8))
+        short_momentum_weight = float(settings.get("short_momentum_weight", 0.6))
+        volume_weight = float(settings.get("volume_weight", 2.0))
+        sector_weight_score = float(settings.get("sector_weight_score", 0.5))
+        high_proximity_weight = float(settings.get("high_proximity_weight", 15.0))
+        sma_alignment_weight = float(settings.get("sma_alignment_weight", 12.0))
+        trend_consistency_weight = float(settings.get("trend_consistency_weight", 8.0))
         score_proportional_sizing = bool(settings.get("score_proportional_sizing", False))
         bull_exposure_pct = float(settings.get("bull_exposure_pct", 0.0))
         bull_max_symbols = int(settings.get("bull_max_symbols", max_symbols))
@@ -237,6 +245,14 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
             use_trend_consistency=use_trend_consistency,
             use_momentum_acceleration=use_momentum_acceleration,
             momentum_acceleration_weight=momentum_acceleration_weight,
+            slow_momentum_weight=slow_momentum_weight,
+            fast_momentum_weight=fast_momentum_weight,
+            short_momentum_weight=short_momentum_weight,
+            volume_weight=volume_weight,
+            sector_weight_score=sector_weight_score,
+            high_proximity_weight=high_proximity_weight,
+            sma_alignment_weight=sma_alignment_weight,
+            trend_consistency_weight=trend_consistency_weight,
         )
         candidates = apply_buzz_earnings_overlay(
             candidates=candidates,
@@ -403,6 +419,14 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
         use_trend_consistency = bool(settings.get("use_trend_consistency", False))
         use_momentum_acceleration = bool(settings.get("use_momentum_acceleration", False))
         momentum_acceleration_weight = float(settings.get("momentum_acceleration_weight", 6.0))
+        slow_momentum_weight = float(settings.get("slow_momentum_weight", 0.9))
+        fast_momentum_weight = float(settings.get("fast_momentum_weight", 1.8))
+        short_momentum_weight = float(settings.get("short_momentum_weight", 0.6))
+        volume_weight = float(settings.get("volume_weight", 2.0))
+        sector_weight_score = float(settings.get("sector_weight_score", 0.5))
+        high_proximity_weight = float(settings.get("high_proximity_weight", 15.0))
+        sma_alignment_weight = float(settings.get("sma_alignment_weight", 12.0))
+        trend_consistency_weight = float(settings.get("trend_consistency_weight", 8.0))
         score_proportional_sizing = bool(settings.get("score_proportional_sizing", False))
         bull_exposure_pct = float(settings.get("bull_exposure_pct", 0.0))
         bull_max_symbols = int(settings.get("bull_max_symbols", max_symbols))
@@ -544,6 +568,14 @@ class AdaptiveSemiPortfolioBacktester(Backtester):
                     use_trend_consistency=use_trend_consistency,
                     use_momentum_acceleration=use_momentum_acceleration,
                     momentum_acceleration_weight=momentum_acceleration_weight,
+                    slow_momentum_weight=slow_momentum_weight,
+                    fast_momentum_weight=fast_momentum_weight,
+                    short_momentum_weight=short_momentum_weight,
+                    volume_weight=volume_weight,
+                    sector_weight_score=sector_weight_score,
+                    high_proximity_weight=high_proximity_weight,
+                    sma_alignment_weight=sma_alignment_weight,
+                    trend_consistency_weight=trend_consistency_weight,
                 )
                 candidates = apply_buzz_earnings_overlay(
                     candidates=candidates,
@@ -708,6 +740,14 @@ def rank_adaptive_candidates(
     use_trend_consistency: bool = False,
     use_momentum_acceleration: bool = False,
     momentum_acceleration_weight: float = 6.0,
+    slow_momentum_weight: float = 0.9,
+    fast_momentum_weight: float = 1.8,
+    short_momentum_weight: float = 0.6,
+    volume_weight: float = 2.0,
+    sector_weight_score: float = 0.5,
+    high_proximity_weight: float = 15.0,
+    sma_alignment_weight: float = 12.0,
+    trend_consistency_weight: float = 8.0,
 ) -> list[AdaptiveCandidate]:
     sector_return = sector_return_pct(bars_by_symbol, current_date, sector_lookback)
     if sector_return < min_sector_return:
@@ -765,24 +805,21 @@ def rank_adaptive_candidates(
         lookback_high = max(b.close for b in prior[-min(252, len(prior)):])
         high_proximity = latest.close / lookback_high if lookback_high > 0 else 1.0
 
-        # Base score: slow momentum + fast momentum + short-term boost
-        # + volume confirmation + sector tailwind + 52w-high proximity
         score = (
-            slow_return * 0.9
-            + fast_return * 1.8
-            + short_return * 0.6
-            + min(volume_ratio, 3.0) * 2.0
-            + sector_return * 0.5
-            + (high_proximity - 0.8) * 15.0
+            slow_return * slow_momentum_weight
+            + fast_return * fast_momentum_weight
+            + short_return * short_momentum_weight
+            + min(volume_ratio, 3.0) * volume_weight
+            + sector_return * sector_weight_score
+            + (high_proximity - 0.8) * high_proximity_weight
         )
 
-        # SMA alignment: stacked SMAs (price > SMA20 > SMA50) signal a confirmed uptrend
         sma_alignment = 0.0
         if use_sma_alignment:
             sma20 = sum(b.close for b in prior[-20:]) / 20
             sma50 = sum(b.close for b in prior[-50:]) / 50
             sma_alignment = (float(latest.close > sma20) + float(sma20 > sma50)) / 2
-            score += sma_alignment * 12.0
+            score += sma_alignment * sma_alignment_weight
 
         # Relative strength: outperformance vs equal-weight sector average
         relative_strength = 0.0
@@ -798,7 +835,7 @@ def rank_adaptive_candidates(
             window = prior[-(fast_lookback + 1):]
             up_days = sum(1 for j in range(1, len(window)) if window[j].close > window[j - 1].close)
             trend_consistency = up_days / fast_lookback
-            score += trend_consistency * 8.0
+            score += trend_consistency * trend_consistency_weight
 
         # Momentum acceleration: fast period gaining more per day than slow period
         # accel_ratio > 1 means the stock is speeding up (early breakout); < 1 = fading

@@ -475,6 +475,9 @@ adaptive_semis_allocator:
   use_trend_consistency: true
   use_momentum_acceleration: false
   momentum_acceleration_weight: 6.0
+  slow_momentum_weight: 1.2
+  fast_momentum_weight: 2.0
+  short_momentum_weight: 0.8
   score_proportional_sizing: true
   bull_exposure_pct: 0.80
   bull_max_symbols: 5
