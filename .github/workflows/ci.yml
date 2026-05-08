@@ -23,5 +23,8 @@ jobs:
       - name: Lint
         run: ruff check .
 
+      - name: Type-check
+        run: mypy semibot/
+
       - name: Run tests
         run: pytest tests/ -v

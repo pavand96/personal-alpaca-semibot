@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -70,7 +70,7 @@ def _fake_signal(symbol: str, probability: float = 0.80) -> MLSignal:
         symbol=symbol,
         probability=probability,
         price=100.0,
-        timestamp=datetime(2026, 1, 2, 10, 0, tzinfo=timezone.utc),
+        timestamp=datetime(2026, 1, 2, 10, 0, tzinfo=UTC),
         action="buy",
         reason=f"ML probability {probability:.0%}",
     )

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
@@ -61,7 +61,7 @@ class SemiMomentumBot:
     def trade_once(self, execute: bool = False) -> list[Decision]:
         self.assert_account_can_trade()
 
-        if self.config["risk"]["require_market_open"] and not self.trading.get_clock().is_open:
+        if self.config["risk"]["require_market_open"] and not self.trading.get_clock().is_open:  # type: ignore[union-attr]
             print("Market is closed. No orders submitted.")
             return []
 
@@ -191,7 +191,7 @@ class SemiMomentumBot:
         return views
 
     def get_positions(self) -> dict[str, Any]:
-        return {position.symbol: position for position in self.trading.get_all_positions()}
+        return {position.symbol: position for position in self.trading.get_all_positions()}  # type: ignore[union-attr]
 
     def submit_order(self, decision: Decision) -> None:
         side = OrderSide.BUY if decision.action == "buy" else OrderSide.SELL
@@ -218,10 +218,10 @@ class SemiMomentumBot:
                 request_kwargs["notional"] = round(decision.notional, 2)
             else:
                 request_kwargs["qty"] = decision.qty
-            order = MarketOrderRequest(**request_kwargs)
+            order = MarketOrderRequest(**request_kwargs)  # type: ignore[assignment]
 
         result = self.trading.submit_order(order_data=order)
-        print(f"Submitted {order_type.upper()} {decision.action.upper()} {decision.symbol}: order_id={result.id}")
+        print(f"Submitted {order_type.upper()} {decision.action.upper()} {decision.symbol}: order_id={result.id}")  # type: ignore[union-attr]
 
     def get_latest_price(self, symbol: str) -> float:
         snapshots = self.data.get_stock_snapshot(
@@ -270,7 +270,7 @@ class SemiMomentumBot:
         append_event(
             self.config["runtime"]["log_file"],
             {
-                "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "timestamp": datetime.now(UTC).isoformat(timespec="seconds"),
                 "event": event,
                 "symbol": decision.symbol,
                 "action": decision.action,

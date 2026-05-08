@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import csv
 from dataclasses import dataclass
-from datetime import date, datetime, time, timezone
+from datetime import UTC, date, datetime, time
 from pathlib import Path
 from typing import Any
 
@@ -232,8 +232,8 @@ class Backtester:
         request = StockBarsRequest(
             symbol_or_symbols=symbols,
             timeframe=TimeFrame.Day,
-            start=datetime.combine(start, time.min, tzinfo=timezone.utc),
-            end=datetime.combine(end, time.max, tzinfo=timezone.utc),
+            start=datetime.combine(start, time.min, tzinfo=UTC),
+            end=datetime.combine(end, time.max, tzinfo=UTC),
             adjustment=self.adjustment,
             feed=self.feed,
         )
@@ -241,7 +241,7 @@ class Backtester:
         raw_bars = getattr(response, "data", response)
 
         bars_by_symbol: dict[str, list[DailyBar]] = {symbol: [] for symbol in symbols}
-        for symbol, bars in raw_bars.items():
+        for symbol, bars in raw_bars.items():  # type: ignore[union-attr]
             for bar in bars:
                 bars_by_symbol.setdefault(symbol, []).append(
                     DailyBar(

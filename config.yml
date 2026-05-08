@@ -89,7 +89,9 @@ news_hold:
   lookback_hours: 24
   limit_per_symbol: 5
   hold_on_any_recent_news: false
-  fail_closed: false
+  # true: block the buy if the news API is unavailable (safer for live trading).
+  # false: allow buys when news data cannot be fetched (backtest-compatible default).
+  fail_closed: true
   block_keywords:
     - accounting probe
     - bankruptcy
@@ -137,6 +139,11 @@ ml:
   target_return_pct: 1.0
   # 0.50 is no filter for logistic regression — the model outputs ~0.5 for uncertain rows.
   # 0.60 is a reasonable starting point; run optimize-ml-params to tune further.
+  # Position sizing: fixed dollar notional OR % of current account equity.
+  # per_trade_pct_of_equity scales automatically as the account grows or shrinks.
+  # If set it takes precedence over per_trade_notional.
+  # 1.0% of $10k = $100 (matches the current fixed default).
+  per_trade_pct_of_equity: 1.0
   buy_probability: 0.60
   sell_probability: 0.25
   # ML-specific risk/position overrides (tuned by parameter optimizer; override global risk/strategy sections).
@@ -150,7 +157,10 @@ ml:
   max_symbols_to_buy_per_run: 3
   feature_lookback_days: 100
   validation_splits: 5
-  validation_gap_days: 1
+  # Gap between train folds and validation folds. 1 day leaks when features
+  # use multi-day rolling windows that span the fold boundary. 5 days is the
+  # minimum to avoid lookahead with the 3-day prediction horizon.
+  validation_gap_days: 5
   random_state: 42
   ml_trades_file: logs/ml_backtest_trades.csv
   optimizer_results_file: logs/ml_parameter_optimization.csv

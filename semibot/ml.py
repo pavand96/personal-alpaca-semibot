@@ -3,7 +3,7 @@ from __future__ import annotations
 import csv
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import UTC, date, datetime, time, timedelta
 from itertools import product
 from pathlib import Path
 from typing import Any
@@ -191,6 +191,7 @@ class MLStrategy:
 
         max_orders = int(self.config["risk"]["max_orders_per_run"])
         max_buys = int(ml_settings.get("max_symbols_to_buy_per_run", self.config["strategy"]["max_symbols_to_buy_per_run"]))
+        per_trade_pct_of_equity = ml_settings.get("per_trade_pct_of_equity")
         per_trade_notional = float(ml_settings.get("per_trade_notional", self.config["strategy"]["per_trade_notional"]))
         max_position_notional = float(ml_settings.get("max_position_notional", self.config["strategy"]["max_position_notional"]))
         min_price = float(self.config["strategy"]["min_price"])
@@ -235,6 +236,8 @@ class MLStrategy:
                 pending_signals = []
 
             equity = cash + market_value(positions, today_bars)
+            if per_trade_pct_of_equity is not None:
+                per_trade_notional = max(1.0, round(equity * float(per_trade_pct_of_equity) / 100, 2))
             peak_equity = max(peak_equity, equity)
             if peak_equity > 0:
                 drawdown_pct = ((equity - peak_equity) / peak_equity) * 100
@@ -273,35 +276,35 @@ class MLStrategy:
             signals: list[dict[str, Any]] = list(risk_signals)
             risk_sell_symbols = {signal["symbol"] for signal in risk_signals}
             buys_used = 0
-            for signal in sorted(predictions, key=lambda item: item.probability, reverse=True):
-                if signal.symbol in risk_sell_symbols:
+            for pred in sorted(predictions, key=lambda item: item.probability, reverse=True):
+                if pred.symbol in risk_sell_symbols:
                     continue
-                position = positions[signal.symbol]
-                held_value = position.qty * signal.price
-                if signal.price < min_price or signal.price > max_price:
+                position = positions[pred.symbol]
+                held_value = position.qty * pred.price
+                if pred.price < min_price or pred.price > max_price:
                     continue
-                if position.qty > 0 and signal.probability <= sell_probability:
+                if position.qty > 0 and pred.probability <= sell_probability:
                     signals.append(
                         {
-                            "symbol": signal.symbol,
+                            "symbol": pred.symbol,
                             "action": "sell",
                             "qty": position.qty,
-                            "reason": signal.reason,
+                            "reason": pred.reason,
                         }
                     )
                     continue
                 if (
-                    signal.probability >= buy_probability
+                    pred.probability >= buy_probability
                     and held_value + per_trade_notional <= max_position_notional
                     and buys_used < max_buys
                 ):
                     adjusted_notional = correlation_adjusted_notional(
-                        symbol=signal.symbol,
+                        symbol=pred.symbol,
                         base_notional=per_trade_notional,
                         held_symbols=[
                             symbol
                             for symbol, held_position in positions.items()
-                            if held_position.qty > 0 and symbol != signal.symbol
+                            if held_position.qty > 0 and symbol != pred.symbol
                         ],
                         bars_by_symbol=bars_by_symbol,
                         as_of_date=current_date,
@@ -312,10 +315,10 @@ class MLStrategy:
                     buys_used += 1
                     signals.append(
                         {
-                            "symbol": signal.symbol,
+                            "symbol": pred.symbol,
                             "action": "buy",
                             "notional": adjusted_notional,
-                            "reason": f"{signal.reason}; correlation-adjusted notional ${adjusted_notional:.2f}",
+                            "reason": f"{pred.reason}; correlation-adjusted notional ${adjusted_notional:.2f}",
                         }
                     )
             pending_signals = signals
@@ -480,23 +483,23 @@ class MLStrategy:
     def ml_trade_once(self, execute: bool = False) -> list[Decision]:
         bot = SemiMomentumBot(self.config, api_key=self.api_key, secret_key=self.secret_key)
         bot.assert_account_can_trade()
-        if self.config["risk"]["require_market_open"] and not bot.trading.get_clock().is_open:
+        if self.config["risk"]["require_market_open"] and not bot.trading.get_clock().is_open:  # type: ignore[union-attr]
             print("Market is closed. No ML orders submitted.")
             return []
 
         positions = bot.get_positions()
         if bot.daily_loss_kill_switch_triggered():
             if self.config["risk"].get("flatten_on_daily_loss", True):
-                decisions = [
+                flatten_decisions = [
                     Decision(position.symbol, "sell", "daily loss kill switch", qty=float(position.qty))
                     for position in positions.values()
                     if float(position.qty) > 0
                 ]
                 return submit_ml_decisions(
                     bot=bot,
-                    decisions=decisions,
+                    decisions=flatten_decisions,
                     dry_run=bool(self.config["risk"]["dry_run"]) or not execute,
-                    max_orders=len(decisions),
+                    max_orders=len(flatten_decisions),
                 )
             print("Daily loss kill switch active. No ML orders submitted.")
             return []
@@ -504,7 +507,13 @@ class MLStrategy:
         dry_run = bool(self.config["risk"]["dry_run"]) or not execute
         max_orders = int(self.config["risk"]["max_orders_per_run"])
         ml_settings = self.config["ml"]
-        per_trade_notional = float(ml_settings.get("per_trade_notional", self.config["strategy"]["per_trade_notional"]))
+        per_trade_pct_of_equity = ml_settings.get("per_trade_pct_of_equity")
+        if per_trade_pct_of_equity is not None:
+            account = bot.trading.get_account()
+            account_equity = float(getattr(account, "equity", 0.0) or 0.0)
+            per_trade_notional = max(1.0, round(account_equity * float(per_trade_pct_of_equity) / 100, 2))
+        else:
+            per_trade_notional = float(ml_settings.get("per_trade_notional", self.config["strategy"]["per_trade_notional"]))
         max_position_notional = float(ml_settings.get("max_position_notional", self.config["strategy"]["max_position_notional"]))
         max_total_position_notional = float(self.config["risk"].get("max_total_position_notional", 10000.0))
         total_position_notional = sum(
@@ -638,8 +647,8 @@ class MLStrategy:
         request = StockBarsRequest(
             symbol_or_symbols=symbols,
             timeframe=TimeFrame.Minute,
-            start=datetime.combine(now.date() - timedelta(days=lookback_days * 3), time.min, tzinfo=timezone.utc),
-            end=now.astimezone(timezone.utc),
+            start=datetime.combine(now.date() - timedelta(days=lookback_days * 3), time.min, tzinfo=UTC),
+            end=now.astimezone(UTC),
             adjustment=self.backtester.adjustment,
             feed=self.backtester.feed,
         )
@@ -650,7 +659,7 @@ class MLStrategy:
         for symbol in symbols:
             bars = [
                 bar
-                for bar in raw_bars.get(symbol, [])
+                for bar in raw_bars.get(symbol, [])  # type: ignore[union-attr]
                 if is_regular_session(bar.timestamp.astimezone(MARKET_TZ).time())
             ]
             if not bars:
@@ -690,7 +699,7 @@ class MLStrategy:
             ]
             vwap = calculate_vwap(
                 [
-                    _intraday_bar_like(
+                    _intraday_bar_like(  # type: ignore[misc]
                         timestamp=bar.timestamp.astimezone(MARKET_TZ),
                         high=float(bar.high),
                         low=float(bar.low),

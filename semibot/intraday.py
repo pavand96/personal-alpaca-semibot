@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import csv
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -153,8 +153,8 @@ class IntradayOpeningMomentumBacktester:
         request = StockBarsRequest(
             symbol_or_symbols=symbols,
             timeframe=TimeFrame.Minute,
-            start=datetime.combine(start, time.min, tzinfo=timezone.utc),
-            end=datetime.combine(end + timedelta(days=1), time.min, tzinfo=timezone.utc),
+            start=datetime.combine(start, time.min, tzinfo=UTC),
+            end=datetime.combine(end + timedelta(days=1), time.min, tzinfo=UTC),
             adjustment=self.adjustment,
             feed=self.feed,
         )
@@ -162,7 +162,7 @@ class IntradayOpeningMomentumBacktester:
         raw_bars = getattr(response, "data", response)
 
         bars_by_symbol: dict[str, list[IntradayBar]] = {symbol: [] for symbol in symbols}
-        for symbol, bars in raw_bars.items():
+        for symbol, bars in raw_bars.items():  # type: ignore[union-attr]
             for bar in bars:
                 timestamp = bar.timestamp.astimezone(MARKET_TZ)
                 if not is_regular_session(timestamp.time()):

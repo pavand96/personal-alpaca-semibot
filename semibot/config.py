@@ -132,9 +132,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "target_return_pct": 1.0,
         "buy_probability": 0.60,
         "sell_probability": 0.40,
+        "per_trade_pct_of_equity": 1.0,
         "feature_lookback_days": 30,
         "validation_splits": 5,
-        "validation_gap_days": 1,
+        "validation_gap_days": 5,
         "random_state": 42,
         "ml_trades_file": "logs/ml_backtest_trades.csv",
         "optimizer_results_file": "logs/ml_parameter_optimization.csv",
@@ -282,6 +283,10 @@ def validate_config(config: dict[str, Any]) -> None:
     if "per_trade_notional" in ml and "max_position_notional" in ml:
         if float(ml["per_trade_notional"]) > float(ml["max_position_notional"]):
             raise ValueError("ml.per_trade_notional cannot exceed ml.max_position_notional")
+    if "per_trade_pct_of_equity" in ml:
+        val = float(ml["per_trade_pct_of_equity"])
+        if not 0.0 < val <= 100.0:
+            raise ValueError(f"ml.per_trade_pct_of_equity must be between 0 and 100 (exclusive), got {val}")
     for key in ("buy_probability", "sell_probability"):
         if key in ml:
             val = float(ml[key])

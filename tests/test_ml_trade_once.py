@@ -1,7 +1,7 @@
 """Tests for MLStrategy.ml_trade_once() — the live entry point for the ML strategy."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -79,7 +79,7 @@ def _signal(symbol: str, probability: float = 0.80, action: str = "buy") -> MLSi
         symbol=symbol,
         probability=probability,
         price=100.0,
-        timestamp=datetime(2026, 1, 2, 10, 0, tzinfo=timezone.utc),
+        timestamp=datetime(2026, 1, 2, 10, 0, tzinfo=UTC),
         action=action,
         reason=f"ML probability {probability:.0%}",
     )
