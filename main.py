@@ -31,6 +31,7 @@ from semibot.ml import (
     print_optimization_results,
     print_training_result,
 )
+from semibot.news_monitor import run_once as run_news_monitor
 from semibot.premarket_backtest import print_premarket_gap_result, run_premarket_gap_backtest
 from semibot.sector_allocator import (
     SectorMomentumAllocatorBacktester,
@@ -269,6 +270,10 @@ def main() -> None:
     def cmd_premarket_trade() -> None:
         AdaptiveSemiPortfolioBacktester(config, api_key=api_key, secret_key=secret_key).spike_scan(execute=args.execute)
 
+    def cmd_news_monitor() -> None:
+        """Scan recent news for catalyst signals and update the signals file."""
+        run_news_monitor(config, api_key=api_key, secret_key=secret_key)
+
     def cmd_premarket_run() -> None:
         cmd_spike_run()
 
@@ -302,6 +307,7 @@ def main() -> None:
         "trade-once": cmd_trade_once,
         "premarket-trade": cmd_premarket_trade,
         "premarket-run": cmd_premarket_run,
+        "news-monitor": cmd_news_monitor,
         "spike-stream": cmd_spike_stream,
         "spike-trade": cmd_spike_trade,
         "spike-run": cmd_spike_run,

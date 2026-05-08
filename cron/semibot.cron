@@ -1,5 +1,11 @@
 CRON_TZ=America/New_York
 
+# ── News monitor — runs all day and night, every 15 min ──────────────────────
+# Scans Alpaca news for catalyst signals (earnings, upgrades, acquisitions, …)
+# Writes logs/news_signals.json — read by the spike stream at startup so it
+# starts pre-warmed with overnight context. Signals expire after 20h.
+*/15 * * * 1-5 /home/pavand96/personal-alpaca-semibot/.venv/bin/python /home/pavand96/personal-alpaca-semibot/main.py news-monitor >> /home/pavand96/personal-alpaca-semibot/logs/news_monitor.log 2>&1
+
 # ── Pre-market spike stream (WebSocket, ~200ms order latency) ─────────────────
 # Starts at 4:00 AM ET. Streams live trades; orders fire the instant 3+ symbols
 # hit the gap threshold. Stream self-exits when market opens at 9:30 AM.

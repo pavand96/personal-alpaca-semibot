@@ -139,47 +139,69 @@ class SpikeStreamScanner:
         self._pending: dict[str, tuple[float, float]] = {}  # symbol → (gap_pct, price)
         self._order_lock = threading.Lock()
         self._earnings_symbols: set[str] = set()
+        # Per-symbol bypass gap threshold — lowered for high-score pre-detected signals
+        self._bypass_gap_by_symbol: dict[str, float] = {}
 
     def load_references(self) -> None:
         self._reference_closes = fetch_reference_closes(self.config, self.api_key, self.secret_key)
 
     def load_earnings_symbols(self) -> None:
-        """Check Alpaca news (last 24h) for earnings/catalyst headlines for each watchlist symbol."""
-        now = datetime.now(MARKET_TZ)
-        since = now - timedelta(hours=24)
-        client = NewsClient(api_key=self.api_key, secret_key=self.secret_key)
-        found: set[str] = set()
+        """Load catalyst signals: pre-detected signals file first, then fresh 24h news scan.
 
-        for symbol in self.config["watchlist"]:
-            try:
-                req = NewsRequest(
-                    symbols=symbol,
-                    start=since.astimezone(UTC),
-                    end=now.astimezone(UTC),
-                    limit=5,
-                )
-                resp = client.get_news(req)
-                articles = getattr(resp, "news", getattr(resp, "data", []))
-                if isinstance(articles, dict):
-                    articles = [
-                        a for vals in articles.values()
-                        for a in (vals if isinstance(vals, list) else [vals])
-                    ]
-                for article in (articles or []):
-                    headline = (getattr(article, "headline", "") or "").lower()
-                    summary = (getattr(article, "summary", "") or "").lower()
-                    if any(kw in headline + " " + summary for kw in _CATALYST_KEYWORDS):
-                        found.add(symbol)
-                        break
-            except Exception as exc:
-                log.warning("News fetch failed for %s: %s", symbol, exc)
+        Pre-detected signals (written by the news monitor cron) are merged with a
+        fresh 24h news fetch so the stream starts with the richest possible context.
+        High-score signals (earnings score >= 4) lower the bypass threshold so even
+        a 6% gap triggers an immediate order without waiting for sector confirmation.
+        """
+        from semibot.news_monitor import _CATALYST_KEYWORDS as MON_KEYWORDS
+        from semibot.news_monitor import load_signals_file, scan_news
+
+        settings = self._settings
+        signals_path = str(settings.get("news_signals_file", "logs/news_signals.json"))
+
+        # 1. Pre-detected signals from the overnight cron
+        pre_signals = load_signals_file(signals_path)
+        if pre_signals:
+            print(f"Pre-detected signals from monitor ({len(pre_signals)}): "
+                  f"{', '.join(sorted(pre_signals))}")
+            for sym, sig in sorted(pre_signals.items(), key=lambda x: -x[1].get("score", 0)):
+                bypass_note = "  [BYPASS]" if sig.get("bypass_confirm") else ""
+                print(f"  {sym:6}  score={sig.get('score', '?')}  {sig.get('headline', '')[:65]}{bypass_note}")
+
+        # 2. Fresh 24h news scan to catch anything missed between cron runs
+        try:
+            fresh = scan_news(self.config, self.api_key, self.secret_key, lookback_minutes=24 * 60)
+        except Exception as exc:
+            log.warning("Fresh news scan failed: %s", exc)
+            fresh = {}
+
+        # Merge: pre-detected + fresh; fresh overwrites for the same symbol
+        merged = {**pre_signals, **fresh}
+
+        found: set[str] = set()
+        bypass_overrides: dict[str, float] = {}
+        for sym, sig in merged.items():
+            found.add(sym)
+            score = int(sig.get("score", 1))
+            bypass_confirm = bool(sig.get("bypass_confirm", False))
+            # High-confidence earnings (score >= 4): lower bypass gap to 6%
+            if bypass_confirm and score >= 4:
+                bypass_overrides[sym] = 6.0
+            # Standard earnings: use configured threshold
+            elif bypass_confirm:
+                bypass_overrides[sym] = self._earnings_bypass_gap
 
         self._earnings_symbols = found
+        self._bypass_gap_by_symbol = bypass_overrides
+
         if found:
-            print(f"Catalyst signals detected (notional ×{self._earnings_multiplier:.1f}): "
+            print(f"Catalyst signals active (notional ×{self._earnings_multiplier:.1f}): "
                   f"{', '.join(sorted(found))}")
+            if bypass_overrides:
+                for sym, thresh in sorted(bypass_overrides.items()):
+                    print(f"  {sym}: bypass at ≥{thresh:.0f}% gap")
         else:
-            print("No catalyst signals in last 24h")
+            print("No catalyst signals detected")
 
     def _get_held_symbols(self) -> set[str]:
         try:
@@ -337,7 +359,9 @@ class SpikeStreamScanner:
                 continue
 
             ts = datetime.now(MARKET_TZ).strftime("%H:%M:%S")
-            bypass = is_earnings and gap_pct >= self._earnings_bypass_gap
+            # Per-symbol bypass threshold: lowered for high-score pre-detected signals
+            bypass_gap = self._bypass_gap_by_symbol.get(symbol, self._earnings_bypass_gap)
+            bypass = is_earnings and gap_pct >= bypass_gap
             to_order: list[tuple[str, float, float]] = []
 
             with self._order_lock:
@@ -347,7 +371,7 @@ class SpikeStreamScanner:
                     self._already_ordered.add(symbol)
                     continue
                 if bypass:
-                    print(f"[{ts}] NEWS BYPASS {symbol}: {gap_pct:+.2f}% (earnings ≥{self._earnings_bypass_gap:.0f}% → no sector confirm)")
+                    print(f"[{ts}] NEWS BYPASS {symbol}: {gap_pct:+.2f}% (earnings ≥{bypass_gap:.0f}% → no sector confirm)")
                     self._already_ordered.add(symbol)
                     to_order.append((symbol, gap_pct, price))
                 else:

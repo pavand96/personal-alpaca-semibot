@@ -496,6 +496,9 @@ adaptive_semis_allocator:
   spike_tracker_path: logs/spike_tracker.json  # tracks entries for 1-day hold exit
   earnings_notional_multiplier: 1.5  # boost notional 1.5× when earnings detected in news
   earnings_bypass_gap_pct: 8.0       # news-triggered gaps this large bypass sector confirmation
+  news_signals_file: logs/news_signals.json  # written by news-monitor cron, read at stream startup
+  news_monitor_lookback_minutes: 30   # how far back each cron run scans for news
+  news_signal_ttl_hours: 20           # signals older than this are discarded (clears overnight by next close)
   score_proportional_sizing: true
   bull_exposure_pct: 0.80
   bull_max_symbols: 5

@@ -467,6 +467,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "spike_tracker_path": "logs/spike_tracker.json",
         "earnings_notional_multiplier": 1.5,
         "earnings_bypass_gap_pct": 8.0,
+        "news_signals_file": "logs/news_signals.json",
+        "news_monitor_lookback_minutes": 30,
+        "news_signal_ttl_hours": 20,
         "trades_file": "logs/adaptive_semis_trades.csv",
     },
 }
